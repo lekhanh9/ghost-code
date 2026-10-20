@@ -91,11 +91,20 @@ public enum MachOConstants {
     public static let MH_MAGIC_64: UInt32 = 0xfeedfacf
     public static let LC_SEGMENT_64: UInt32 = 0x19
     public static let LC_CODE_SIGNATURE: UInt32 = 0x1d
+    public static let CSMAGIC_CODEDIRECTORY: UInt32 = 0xfade0c02
+    public static let CSMAGIC_EMBEDDED_SIGNATURE: UInt32 = 0xfade0cc0
     public static let CS_MAGIC_EMBEDDED_SIGNATURE: UInt32 = 0xfade0cc0
+    public static let CSMAGIC_EMBEDDED_ENTITLEMENTS: UInt32 = 0xfade7171
+    public static let CSMAGIC_EMBEDDED_DER_ENTITLEMENTS: UInt32 = 0xfade7172
 
     public static let CSSLOT_CODEDIRECTORY: UInt32 = 0
+    public static let CSSLOT_INFOPLIST: UInt32 = 1
     public static let CSSLOT_REQUIREMENTS: UInt32 = 2
+    public static let CSSLOT_RESOURCEDIR: UInt32 = 3
+    public static let CSSLOT_APPLICATION: UInt32 = 4
     public static let CSSLOT_ENTITLEMENTS: UInt32 = 5
     public static let CSSLOT_DER_ENTITLEMENTS: UInt32 = 7
     public static let CSSLOT_SIGNATURESLOT: UInt32 = 0x10000
+
+    public static let CS_HASHTYPE_SHA256: UInt8 = 2
 }
