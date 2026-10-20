@@ -1,0 +1,19 @@
+.DS_Store
+/.build
+/Packages
+xcuserdata/
+DerivedData/
+.swiftpm/configuration/registries.json
+.swiftpm/xcode/package.xcworkspace/contents.xcworkspacedata
+.netrc
+
+# System & home directory files
+.*
+!.gitignore
+LICENSE.txt
+swiftly-x86_64.tar.gz
+java
+nvm
+MobileProcessKit/
+minimuxer/
+sidestore/
