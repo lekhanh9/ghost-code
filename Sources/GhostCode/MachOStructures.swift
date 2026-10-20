@@ -62,3 +62,40 @@ public struct LinkeditDataCommand: Sendable, Equatable {
         self.datasize = datasize
     }
 }
+
+@frozen
+public struct SuperBlobHeader: Sendable, Equatable {
+    public var magic: UInt32
+    public var length: UInt32
+    public var count: UInt32
+
+    public init(magic: UInt32 = 0, length: UInt32 = 0, count: UInt32 = 0) {
+        self.magic = magic
+        self.length = length
+        self.count = count
+    }
+}
+
+@frozen
+public struct BlobIndex: Sendable, Equatable {
+    public var type: UInt32
+    public var offset: UInt32
+
+    public init(type: UInt32 = 0, offset: UInt32 = 0) {
+        self.type = type
+        self.offset = offset
+    }
+}
+
+public enum MachOConstants {
+    public static let MH_MAGIC_64: UInt32 = 0xfeedfacf
+    public static let LC_SEGMENT_64: UInt32 = 0x19
+    public static let LC_CODE_SIGNATURE: UInt32 = 0x1d
+    public static let CS_MAGIC_EMBEDDED_SIGNATURE: UInt32 = 0xfade0cc0
+
+    public static let CSSLOT_CODEDIRECTORY: UInt32 = 0
+    public static let CSSLOT_REQUIREMENTS: UInt32 = 2
+    public static let CSSLOT_ENTITLEMENTS: UInt32 = 5
+    public static let CSSLOT_DER_ENTITLEMENTS: UInt32 = 7
+    public static let CSSLOT_SIGNATURESLOT: UInt32 = 0x10000
+}
