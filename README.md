@@ -13,7 +13,7 @@ GhostCode provides complete, cross-platform Apple code signing capabilities—in
 - **Novel 2-Pass Page 0 Hashing**: Solves the classic Mach-O load command injection paradox by pre-injecting `LC_CODE_SIGNATURE`, recalculating Page 0 byte hashes over updated load commands, and rewriting the SuperBlob in-place.
 - **Complete Bundle Sealer (`CodeResources`)**: Generates Apple-compliant XML plists with both SHA-1 and SHA-256 resource digests, recursive nested bundle/framework sealing, and symlink cycle protection.
 - **MobileProvision Integration**: Extracts entitlement dictionaries directly from CMS-wrapped `.mobileprovision` files using safe reverse tag scanning, embedding profiles into `embedded.mobileprovision`.
-- **Flexible Signing Modes**: Supports Ad-Hoc signing (`--adhoc`, flag `0x20002`) and identity-based signing (`--p12`, PKCS#12 certificate & private key).
+- **Flexible Signing Modes**: Supports Ad-Hoc signing (`--adhoc`, flag `0x20002`), PKCS#12 bundles (`--p12`), and raw PEM/DER keypairs (`--cert cert.pem --key key.pem`).
 - **Universal CLI & Cross-Platform Engine**: Runs on Linux and macOS; handles raw Mach-O binaries, `.app` directory bundles, and `.ipa` archives.
 - **Rigorously Tested**: 68 comprehensive unit and adversarial test suites + automated 10-step signature diagnostic verifier (`verify.sh`).
 
@@ -88,6 +88,8 @@ GhostCLI <target.app or .ipa or binary> [OPTIONS]
 |---|---|
 | `--adhoc` | Perform Ad-Hoc code signing (no certificate required, sets flag `0x20002`). |
 | `--p12 <path>` | Path to PKCS#12 (`.p12`) certificate and private key file. |
+| `--cert <path>` | Path to certificate file in PEM (`cert.pem`) or DER format. |
+| `--key <path>` | Path to private key file in PEM (`key.pem`) or DER format. |
 | `--password <pass>` | Password for the PKCS#12 file. |
 | `--provision <path>` | Path to `.mobileprovision` provisioning profile. Embedded into bundle and used to extract entitlements. |
 | `--entitlements <path>` | Path to custom XML entitlements `.plist`. |
@@ -106,12 +108,21 @@ GhostCLI <target.app or .ipa or binary> [OPTIONS]
   --output signed_app.ipa
 ```
 
-#### 2. Ad-Hoc Sign an `.app` Bundle
+#### 2. Sign an `.ipa` with PEM Certificate & Private Key (`cert.pem` & `key.pem`)
+```bash
+./.build/release/GhostCLI my_app.ipa \
+  --cert cert.pem \
+  --key key.pem \
+  --provision embedded.mobileprovision \
+  --output signed_app.ipa
+```
+
+#### 3. Ad-Hoc Sign an `.app` Bundle
 ```bash
 ./.build/release/GhostCLI Payload/Test.app --adhoc
 ```
 
-#### 3. Sign a Raw Mach-O Binary with Custom Entitlements
+#### 4. Sign a Raw Mach-O Binary with Custom Entitlements
 ```bash
 ./.build/release/GhostCLI my_binary \
   --entitlements entitlements.plist \

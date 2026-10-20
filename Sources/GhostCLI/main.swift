@@ -7,6 +7,8 @@ import Security
 
 struct CLIArgs {
     var p12Path: String?
+    var certPath: String?
+    var keyPath: String?
     var password: String?
     var provisionPath: String?
     var targetPath: String?
@@ -25,6 +27,10 @@ func parseArguments(_ args: [String]) -> CLIArgs {
             parsed.adhoc = true
         case "--p12":
             if i + 1 < args.count { parsed.p12Path = args[i + 1]; i += 1 }
+        case "--cert":
+            if i + 1 < args.count { parsed.certPath = args[i + 1]; i += 1 }
+        case "--key":
+            if i + 1 < args.count { parsed.keyPath = args[i + 1]; i += 1 }
         case "--password":
             if i + 1 < args.count { parsed.password = args[i + 1]; i += 1 }
         case "--provision":
@@ -47,10 +53,65 @@ struct CLIError: Error, CustomStringConvertible {
     let description: String
 }
 
-func loadCredentials(p12Path: String?, password: String?, adhoc: Bool) throws -> (SecCertificate?, SecKey?) {
+func loadCredentials(p12Path: String?, certPath: String?, keyPath: String?, password: String?, adhoc: Bool) throws -> (SecCertificate?, SecKey?) {
     if adhoc {
         return (nil, nil)
     }
+
+    if (certPath != nil && keyPath == nil) || (certPath == nil && keyPath != nil) {
+        throw CLIError(description: "Both --cert and --key must be provided together.")
+    }
+
+    if let certPath = certPath, let keyPath = keyPath {
+        let certURL = URL(fileURLWithPath: certPath)
+        let keyURL = URL(fileURLWithPath: keyPath)
+
+        guard let certData = try? Data(contentsOf: certURL) else {
+            throw CLIError(description: "Could not read certificate file at \(certPath)")
+        }
+        guard let keyData = try? Data(contentsOf: keyURL) else {
+            throw CLIError(description: "Could not read private key file at \(keyPath)")
+        }
+
+        #if canImport(Security) && os(macOS)
+        if let cert = PEMHelper.loadCertificate(from: certData),
+           let key = PEMHelper.loadPrivateKey(from: keyData) {
+            return (cert, key)
+        }
+        // Fallback for macOS: export to temporary PKCS#12 via OpenSSL if available
+        let tempP12URL = FileManager.default.temporaryDirectory.appendingPathComponent("ghostcli_\(UUID().uuidString).p12")
+        defer { try? FileManager.default.removeItem(at: tempP12URL) }
+        let opensslStatus = (try? runCommand("/usr/bin/openssl", [
+            "pkcs12", "-export",
+            "-in", certURL.path,
+            "-inkey", keyURL.path,
+            "-out", tempP12URL.path,
+            "-passout", "pass:temp_pass"
+        ])) ?? 1
+        if opensslStatus == 0, let p12Bytes = try? Data(contentsOf: tempP12URL) {
+            var items: CFArray?
+            let options: [String: Any] = [kSecImportExportPassphrase as String: "temp_pass"]
+            let status = SecPKCS12Import(p12Bytes as CFData, options as CFDictionary, &items)
+            if status == errSecSuccess, let itemsArray = items as? [[String: Any]], let first = itemsArray.first {
+                let identity = first[kSecImportItemIdentity as String] as! SecIdentity
+                var cert: SecCertificate?
+                SecIdentityCopyCertificate(identity, &cert)
+                var key: SecKey?
+                SecIdentityCopyPrivateKey(identity, &key)
+                return (cert, key)
+            }
+        }
+        #endif
+
+        guard let cert = PEMHelper.loadCertificate(from: certData) else {
+            throw CLIError(description: "Failed to parse certificate from \(certPath)")
+        }
+        guard let key = PEMHelper.loadPrivateKey(from: keyData) else {
+            throw CLIError(description: "Failed to parse private key from \(keyPath)")
+        }
+        return (cert, key)
+    }
+
     guard let p12Path = p12Path else {
         return (nil, nil)
     }
@@ -99,7 +160,7 @@ func runCommand(_ executable: String, _ arguments: [String], currentDirectory: U
 func main() {
     let args = parseArguments(CommandLine.arguments)
     guard let targetPath = args.targetPath else {
-        print("Usage: GhostCLI <target.app or .ipa or binary> [--adhoc] [--p12 <path>] [--password <pass>] [--provision <path>] [--entitlements <path>] [--output <path>]")
+        print("Usage: GhostCLI <target.app or .ipa or binary> [--adhoc] [--p12 <path> --password <pass>] [--cert <path> --key <path>] [--provision <path>] [--entitlements <path>] [--output <path>]")
         return
     }
 
@@ -118,7 +179,13 @@ func main() {
     let signer = GhostSigner()
 
     do {
-        let (cert, key) = try loadCredentials(p12Path: args.p12Path, password: args.password, adhoc: args.adhoc)
+        let (cert, key) = try loadCredentials(
+            p12Path: args.p12Path,
+            certPath: args.certPath,
+            keyPath: args.keyPath,
+            password: args.password,
+            adhoc: args.adhoc
+        )
 
         if targetURL.pathExtension.lowercased() == "ipa" {
             let outputPath = args.outputPath ?? targetURL.path
