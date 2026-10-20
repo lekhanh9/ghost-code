@@ -14,10 +14,18 @@ let package = Package(
             name: "GhostCode",
             targets: ["GhostCode"]
         ),
+        .executable(
+            name: "GhostCLI",
+            targets: ["GhostCLI"]
+        ),
     ],
     targets: [
         .target(
             name: "GhostCode"
+        ),
+        .executableTarget(
+            name: "GhostCLI",
+            dependencies: ["GhostCode"]
         ),
         .testTarget(
             name: "GhostCodeTests",

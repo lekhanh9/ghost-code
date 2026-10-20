@@ -62,16 +62,20 @@ public struct CodeDirectoryBuilder {
         codeLimit: Int? = nil,
         identifier: String = "GhostCode",
         xmlEntitlements: Data? = nil,
-        derEntitlements: Data? = nil
+        derEntitlements: Data? = nil,
+        infoPlistData: Data? = nil,
+        resourceDirData: Data? = nil
     ) -> Data {
         let actualCodeLimit = min(codeLimit ?? binaryData.count, binaryData.count)
         let pageSize = defaultPageSize
         let nCodeSlots = (actualCodeLimit + pageSize - 1) / pageSize
 
         // Slots:
+        // Slot -1 = CSSLOT_INFOPLIST
+        // Slot -3 = CSSLOT_RESOURCEDIR
         // Slot -5 = CSSLOT_ENTITLEMENTS (XML)
         // Slot -7 = CSSLOT_DER_ENTITLEMENTS (DER)
-        let nSpecialSlots: UInt32 = (derEntitlements != nil) ? 7 : ((xmlEntitlements != nil) ? 5 : 7)
+        let nSpecialSlots: UInt32 = (derEntitlements != nil) ? 7 : ((xmlEntitlements != nil) ? 5 : ((resourceDirData != nil) ? 3 : 7))
 
         let hashSize: Int = 32 // SHA-256
         let headerSize = 44
@@ -125,6 +129,18 @@ public struct CodeDirectoryBuilder {
         // Special slots buffer: nSpecialSlots * 32 bytes
         // Slot -k is stored at: (nSpecialSlots - k) * 32
         var specialSlotsData = Data(repeating: 0, count: specialSlotsByteCount)
+
+        if let info = infoPlistData, nSpecialSlots >= 1 {
+            let digest = sha256(info)
+            let offset = Int(nSpecialSlots - 1) * hashSize
+            specialSlotsData.replaceSubrange(offset..<(offset + hashSize), with: digest)
+        }
+
+        if let res = resourceDirData, nSpecialSlots >= 3 {
+            let digest = sha256(res)
+            let offset = Int(nSpecialSlots - 3) * hashSize
+            specialSlotsData.replaceSubrange(offset..<(offset + hashSize), with: digest)
+        }
 
         if let xml = xmlEntitlements, nSpecialSlots >= 5 {
             let digest = sha256(xml)

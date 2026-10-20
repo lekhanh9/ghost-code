@@ -96,6 +96,7 @@ public enum MachOConstants {
     public static let CS_MAGIC_EMBEDDED_SIGNATURE: UInt32 = 0xfade0cc0
     public static let CSMAGIC_EMBEDDED_ENTITLEMENTS: UInt32 = 0xfade7171
     public static let CSMAGIC_EMBEDDED_DER_ENTITLEMENTS: UInt32 = 0xfade7172
+    public static let CSMAGIC_BLOBWRAPPER: UInt32 = 0xfade0b01
 
     public static let CSSLOT_CODEDIRECTORY: UInt32 = 0
     public static let CSSLOT_INFOPLIST: UInt32 = 1
@@ -106,5 +107,10 @@ public enum MachOConstants {
     public static let CSSLOT_DER_ENTITLEMENTS: UInt32 = 7
     public static let CSSLOT_SIGNATURESLOT: UInt32 = 0x10000
 
+    public static let CS_HASHTYPE_SHA1: UInt8 = 1
     public static let CS_HASHTYPE_SHA256: UInt8 = 2
 }
+
+public let CSMAGIC_BLOBWRAPPER: UInt32 = MachOConstants.CSMAGIC_BLOBWRAPPER
+public let CS_HASHTYPE_SHA1: UInt8 = MachOConstants.CS_HASHTYPE_SHA1
+

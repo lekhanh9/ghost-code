@@ -8,7 +8,13 @@ public final class GhostSigner: @unchecked Sendable {
         try signer.sign(binaryURL: binaryURL, entitlements: entitlements, outputURL: outputURL)
     }
 
-    public func sign(binaryURL: URL, entitlements: [String: Any]? = nil, outputURL: URL? = nil) throws {
+    public func sign(
+        binaryURL: URL,
+        entitlements: [String: Any]? = nil,
+        cert: SecCertificate? = nil,
+        key: SecKey? = nil,
+        outputURL: URL? = nil
+    ) throws {
         var binaryData: Data
         do {
             binaryData = try Data(contentsOf: binaryURL)
@@ -16,7 +22,7 @@ public final class GhostSigner: @unchecked Sendable {
             throw MachOWriterError.fileWriteError("Failed to read binary at \(binaryURL.path): \(error.localizedDescription)")
         }
 
-        try sign(binaryData: &binaryData, entitlements: entitlements)
+        try sign(binaryData: &binaryData, entitlements: entitlements, cert: cert, key: key)
 
         let destinationURL = outputURL ?? binaryURL
         do {
@@ -26,7 +32,14 @@ public final class GhostSigner: @unchecked Sendable {
         }
     }
 
-    public func sign(binaryData: inout Data, entitlements: [String: Any]? = nil) throws {
+    public func sign(
+        binaryData: inout Data,
+        entitlements: [String: Any]? = nil,
+        cert: SecCertificate? = nil,
+        key: SecKey? = nil,
+        infoPlistData: Data? = nil,
+        resourceDirData: Data? = nil
+    ) throws {
         // 1. Determine base binary size (up to existing LC_CODE_SIGNATURE if present)
         let codeLimit = getBaseBinarySize(from: binaryData)
 
@@ -45,18 +58,106 @@ public final class GhostSigner: @unchecked Sendable {
             codeLimit: codeLimit,
             identifier: "GhostCode",
             xmlEntitlements: xmlData,
-            derEntitlements: derData
+            derEntitlements: derData,
+            infoPlistData: infoPlistData,
+            resourceDirData: resourceDirData
         )
 
-        // 4. Build SuperBlob containing CodeDirectory, XML entitlements, and DER entitlements
+        // 4. Generate CMS signature if cert & key are provided
+        var cmsSignature: Data? = nil
+        if let cert = cert, let key = key {
+            cmsSignature = try CMSSigner.signCodeDirectory(codeDirectoryData: codeDirectory, cert: cert, key: key)
+        }
+
+        // 5. Build SuperBlob containing CodeDirectory, XML entitlements, DER entitlements, and CMS blob
         let superBlob = SuperBlobBuilder.build(
             codeDirectory: codeDirectory,
             xmlEntitlements: xmlData,
-            derEntitlements: derData
+            derEntitlements: derData,
+            cmsSignature: cmsSignature
         )
 
-        // 5. Inject SuperBlob into Mach-O binary
+        // 6. Inject SuperBlob into Mach-O binary
         try MachOWriter.injectCodeSignature(into: &binaryData, signatureData: superBlob)
+    }
+
+    public func signBundle(
+        appURL: URL,
+        cert: SecCertificate? = nil,
+        key: SecKey? = nil,
+        entitlements: [String: Any]? = nil
+    ) throws {
+        let fileManager = FileManager.default
+
+        // 1. Sign nested frameworks bottom-up
+        let frameworksURL = appURL.appendingPathComponent("Frameworks")
+        if fileManager.fileExists(atPath: frameworksURL.path) {
+            let frameworkItems = try? fileManager.contentsOfDirectory(at: frameworksURL, includingPropertiesForKeys: nil)
+            for item in frameworkItems ?? [] {
+                if item.pathExtension == "framework" {
+                    let frameworkExeName = item.deletingPathExtension().lastPathComponent
+                    let frameworkExeURL = item.appendingPathComponent(frameworkExeName)
+                    if fileManager.fileExists(atPath: frameworkExeURL.path) {
+                        try sign(binaryURL: frameworkExeURL, entitlements: nil, cert: cert, key: key)
+                    }
+                } else if item.pathExtension == "dylib" {
+                    try sign(binaryURL: item, entitlements: nil, cert: cert, key: key)
+                }
+            }
+        }
+
+        // 2. Sign nested plugins
+        let plugInsURL = appURL.appendingPathComponent("PlugIns")
+        if fileManager.fileExists(atPath: plugInsURL.path) {
+            let pluginItems = try? fileManager.contentsOfDirectory(at: plugInsURL, includingPropertiesForKeys: nil)
+            for item in pluginItems ?? [] where item.pathExtension == "appex" {
+                try signBundle(appURL: item, cert: cert, key: key, entitlements: entitlements)
+            }
+        }
+
+        // 3. Generate CodeResources via BundleSealer
+        let codeResourcesData = try BundleSealer.generateCodeResources(for: appURL)
+
+        // 4. Locate main executable and Info.plist
+        let infoPlistURL = appURL.appendingPathComponent("Info.plist")
+        var mainExecutableURL: URL?
+
+        if fileManager.fileExists(atPath: infoPlistURL.path) {
+            if let data = try? Data(contentsOf: infoPlistURL),
+               let plist = try? PropertyListSerialization.propertyList(from: data, options: [], format: nil) as? [String: Any],
+               let exeName = plist["CFBundleExecutable"] as? String {
+                let candidate = appURL.appendingPathComponent(exeName)
+                if fileManager.fileExists(atPath: candidate.path) {
+                    mainExecutableURL = candidate
+                }
+            }
+        }
+
+        if mainExecutableURL == nil {
+            let appBaseName = appURL.deletingPathExtension().lastPathComponent
+            let candidate = appURL.appendingPathComponent(appBaseName)
+            if fileManager.fileExists(atPath: candidate.path) {
+                mainExecutableURL = candidate
+            }
+        }
+
+        guard let executableURL = mainExecutableURL else {
+            throw MachOWriterError.fileWriteError("Could not locate main executable in bundle at \(appURL.path)")
+        }
+
+        let infoPlistData = try? Data(contentsOf: infoPlistURL)
+
+        // 5. Sign main executable
+        var exeData = try Data(contentsOf: executableURL)
+        try sign(
+            binaryData: &exeData,
+            entitlements: entitlements,
+            cert: cert,
+            key: key,
+            infoPlistData: infoPlistData,
+            resourceDirData: codeResourcesData
+        )
+        try exeData.write(to: executableURL)
     }
 
     private func getBaseBinarySize(from data: Data) -> Int {

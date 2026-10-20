@@ -11,6 +11,14 @@ public enum CryptoHelpers {
         return NativeSHA256.hash(data)
         #endif
     }
+
+    public static func sha1(_ data: Data) -> Data {
+        #if canImport(CryptoKit)
+        return Data(Insecure.SHA1.hash(data: data))
+        #else
+        return NativeSHA1.hash(data)
+        #endif
+    }
 }
 
 // MARK: - Native SHA-256 for non-Darwin environments (Zero-Dependency)
@@ -115,3 +123,90 @@ public enum NativeSHA256 {
         return result
     }
 }
+
+// MARK: - Native SHA-1 for non-Darwin environments (Zero-Dependency)
+
+public enum NativeSHA1 {
+    public static func hash(_ data: Data) -> Data {
+        var h0: UInt32 = 0x67452301
+        var h1: UInt32 = 0xEFCDAB89
+        var h2: UInt32 = 0x98BADCFE
+        var h3: UInt32 = 0x10325476
+        var h4: UInt32 = 0xC3D2E1F0
+
+        var message = data
+        let bitLength = UInt64(data.count) * 8
+
+        // Pad message: append 0x80, then 0x00 until count % 64 == 56
+        message.append(0x80)
+        while (message.count % 64) != 56 {
+            message.append(0x00)
+        }
+
+        // Append 64-bit big-endian length
+        var beLength = bitLength.bigEndian
+        withUnsafeBytes(of: &beLength) { message.append(contentsOf: $0) }
+
+        // Process each 64-byte chunk
+        var w = [UInt32](repeating: 0, count: 80)
+        for chunkStart in stride(from: 0, to: message.count, by: 64) {
+            for i in 0..<16 {
+                let offset = chunkStart + i * 4
+                w[i] = message.withUnsafeBytes { raw in
+                    UInt32(bigEndian: raw.loadUnaligned(fromByteOffset: offset, as: UInt32.self))
+                }
+            }
+
+            for i in 16..<80 {
+                let val = w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16]
+                w[i] = (val &<< 1) | (val &>> 31)
+            }
+
+            var a = h0
+            var b = h1
+            var c = h2
+            var d = h3
+            var e = h4
+
+            for i in 0..<80 {
+                let f: UInt32
+                let k: UInt32
+                if i < 20 {
+                    f = (b & c) | ((~b) & d)
+                    k = 0x5A827999
+                } else if i < 40 {
+                    f = b ^ c ^ d
+                    k = 0x6ED9EBA1
+                } else if i < 60 {
+                    f = (b & c) | (b & d) | (c & d)
+                    k = 0x8F1BBCDC
+                } else {
+                    f = b ^ c ^ d
+                    k = 0xCA62C1D6
+                }
+
+                let rotlA5 = (a &<< 5) | (a &>> 27)
+                let temp = rotlA5 &+ f &+ e &+ k &+ w[i]
+                e = d
+                d = c
+                c = (b &<< 30) | (b &>> 2)
+                b = a
+                a = temp
+            }
+
+            h0 = h0 &+ a
+            h1 = h1 &+ b
+            h2 = h2 &+ c
+            h3 = h3 &+ d
+            h4 = h4 &+ e
+        }
+
+        var result = Data()
+        let parts = [h0.bigEndian, h1.bigEndian, h2.bigEndian, h3.bigEndian, h4.bigEndian]
+        for var part in parts {
+            withUnsafeBytes(of: &part) { result.append(contentsOf: $0) }
+        }
+        return result
+    }
+}
+

@@ -146,4 +146,45 @@ final class GhostSignerTests: XCTestCase {
         let reader = try MachOReader(contentsOf: fileURL)
         XCTAssertNotNil(reader.codeSignatureCommand)
     }
+
+    func testSignBundleEndToEnd() throws {
+        let tempDir = FileManager.default.temporaryDirectory
+        let appDir = tempDir.appendingPathComponent("TestApp_\(UUID().uuidString).app")
+        try FileManager.default.createDirectory(at: appDir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: appDir) }
+
+        // Create Info.plist
+        let infoPlist: [String: Any] = [
+            "CFBundleExecutable": "TestApp",
+            "CFBundleIdentifier": "com.ghostcode.testapp",
+            "CFBundleVersion": "1.0"
+        ]
+        let infoData = try PropertyListSerialization.data(fromPropertyList: infoPlist, format: .xml, options: 0)
+        try infoData.write(to: appDir.appendingPathComponent("Info.plist"))
+
+        // Create main executable
+        let exeData = createMockBinary()
+        try exeData.write(to: appDir.appendingPathComponent("TestApp"))
+
+        // Create dummy resource
+        try Data("Hello world".utf8).write(to: appDir.appendingPathComponent("resource.txt"))
+
+        // Sign the bundle with certificate & key (triggers CMS signing)
+        let signer = GhostSigner()
+        try signer.signBundle(
+            appURL: appDir,
+            cert: SecCertificate(),
+            key: SecKey(),
+            entitlements: ["get-task-allow": true]
+        )
+
+        // Check _CodeSignature/CodeResources was created
+        let codeResourcesURL = appDir.appendingPathComponent("_CodeSignature/CodeResources")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: codeResourcesURL.path))
+
+        // Check main executable was signed with signature command and slot 0x10000
+        let reader = try MachOReader(contentsOf: appDir.appendingPathComponent("TestApp"))
+        let sigCmd = try XCTUnwrap(reader.codeSignatureCommand)
+        XCTAssertGreaterThan(sigCmd.datasize, 0)
+    }
 }

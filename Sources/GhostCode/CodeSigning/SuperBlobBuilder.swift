@@ -14,7 +14,8 @@ public struct SuperBlobBuilder {
     public static func build(
         codeDirectory: Data,
         xmlEntitlements: Data? = nil,
-        derEntitlements: Data? = nil
+        derEntitlements: Data? = nil,
+        cmsSignature: Data? = nil
     ) -> Data {
         var entries = [BlobEntry]()
 
@@ -37,6 +38,15 @@ public struct SuperBlobBuilder {
             appendBigEndian(UInt32(8 + der.count), to: &blob)
             blob.append(der)
             entries.append(BlobEntry(type: MachOConstants.CSSLOT_DER_ENTITLEMENTS, data: blob))
+        }
+
+        // 4. CMS Signature (CSSLOT_SIGNATURESLOT = 0x10000) wrapped in CSMAGIC_BLOBWRAPPER
+        if let cms = cmsSignature {
+            var blob = Data()
+            appendBigEndian(MachOConstants.CSMAGIC_BLOBWRAPPER, to: &blob)
+            appendBigEndian(UInt32(8 + cms.count), to: &blob)
+            blob.append(cms)
+            entries.append(BlobEntry(type: MachOConstants.CSSLOT_SIGNATURESLOT, data: blob))
         }
 
         return build(entries: entries)
