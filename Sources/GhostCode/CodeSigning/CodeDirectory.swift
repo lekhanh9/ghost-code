@@ -64,7 +64,8 @@ public struct CodeDirectoryBuilder {
         xmlEntitlements: Data? = nil,
         derEntitlements: Data? = nil,
         infoPlistData: Data? = nil,
-        resourceDirData: Data? = nil
+        resourceDirData: Data? = nil,
+        isAdHoc: Bool = true
     ) -> Data {
         let actualCodeLimit = min(codeLimit ?? binaryData.count, binaryData.count)
         let pageSize = defaultPageSize
@@ -94,7 +95,7 @@ public struct CodeDirectoryBuilder {
             magic: MachOConstants.CSMAGIC_CODEDIRECTORY,
             length: UInt32(totalLength),
             version: 0x20400,
-            flags: 0x20002, // ad-hoc
+            flags: isAdHoc ? 0x20002 : 0x20000,
             hashOffset: UInt32(hashOffset),
             identOffset: UInt32(identOffset),
             nSpecialSlots: nSpecialSlots,

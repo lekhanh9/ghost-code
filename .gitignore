@@ -17,3 +17,5 @@ nvm
 MobileProcessKit/
 minimuxer/
 sidestore/
+test_env/
+test_env

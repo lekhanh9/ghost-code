@@ -187,4 +187,235 @@ final class GhostSignerTests: XCTestCase {
         let sigCmd = try XCTUnwrap(reader.codeSignatureCommand)
         XCTAssertGreaterThan(sigCmd.datasize, 0)
     }
+
+    func testExtractEntitlementsValidXML() {
+        let xml = """
+        <?xml version="1.0" encoding="UTF-8"?>
+        <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+        <plist version="1.0">
+        <dict>
+            <key>AppIDName</key>
+            <string>TestApp</string>
+            <key>Entitlements</key>
+            <dict>
+                <key>application-identifier</key>
+                <string>TESTTEAM123.com.ghostcode.testapp</string>
+                <key>get-task-allow</key>
+                <true/>
+                <key>com.apple.developer.team-identifier</key>
+                <string>TESTTEAM123</string>
+            </dict>
+        </dict>
+        </plist>
+        """
+        var mockProfileData = Data([0x30, 0x82, 0x05, 0x10, 0x06, 0x09])
+        mockProfileData.append(Data(xml.utf8))
+        mockProfileData.append(Data([0x00, 0x01, 0x02, 0x03]))
+
+        let entitlements = GhostSigner.extractEntitlements(fromMobileProvisionData: mockProfileData)
+        XCTAssertNotNil(entitlements)
+        XCTAssertEqual(entitlements?["application-identifier"] as? String, "TESTTEAM123.com.ghostcode.testapp")
+        XCTAssertEqual(entitlements?["get-task-allow"] as? Bool, true)
+        XCTAssertEqual(entitlements?["com.apple.developer.team-identifier"] as? String, "TESTTEAM123")
+    }
+
+    func testExtractEntitlementsMalformedOrReversed() {
+        // Reversed tags must cleanly return nil without crash
+        let reversedData = Data("</plist> some text <plist>".utf8)
+        XCTAssertNil(GhostSigner.extractEntitlements(fromMobileProvisionData: reversedData))
+
+        let onlyClosing = Data("</plist>".utf8)
+        XCTAssertNil(GhostSigner.extractEntitlements(fromMobileProvisionData: onlyClosing))
+
+        let onlyOpening = Data("<plist>".utf8)
+        XCTAssertNil(GhostSigner.extractEntitlements(fromMobileProvisionData: onlyOpening))
+
+        let emptyData = Data()
+        XCTAssertNil(GhostSigner.extractEntitlements(fromMobileProvisionData: emptyData))
+
+        let garbageData = Data([0x00, 0xff, 0xee, 0xdd])
+        XCTAssertNil(GhostSigner.extractEntitlements(fromMobileProvisionData: garbageData))
+    }
+
+    func testExtractEntitlementsAdversarialStressFuzzing() {
+        // 1. Exact boundary: </plist><plist>
+        XCTAssertNil(GhostSigner.extractEntitlements(fromMobileProvisionData: Data("</plist><plist>".utf8)))
+
+        // 2. Exact boundary with reversed uppercase/lowercase
+        XCTAssertNil(GhostSigner.extractEntitlements(fromMobileProvisionData: Data("</PLIST><plist>".utf8)))
+        XCTAssertNil(GhostSigner.extractEntitlements(fromMobileProvisionData: Data("</plist><PLIST>".utf8)))
+
+        // 3. Nested tags and multiple closing tags
+        XCTAssertNil(GhostSigner.extractEntitlements(fromMobileProvisionData: Data("<plist><plist></plist></plist>".utf8)))
+        XCTAssertNil(GhostSigner.extractEntitlements(fromMobileProvisionData: Data("</plist></plist></plist>".utf8)))
+        XCTAssertNil(GhostSigner.extractEntitlements(fromMobileProvisionData: Data("<plist><plist><plist>".utf8)))
+        XCTAssertNil(GhostSigner.extractEntitlements(fromMobileProvisionData: Data("<plist></plist></plist>".utf8)))
+        XCTAssertNil(GhostSigner.extractEntitlements(fromMobileProvisionData: Data("</plist></plist><plist>".utf8)))
+        XCTAssertNil(GhostSigner.extractEntitlements(fromMobileProvisionData: Data("<plist/>".utf8)))
+
+        // 4. Multiple closing tags around content without Entitlements
+        let multiClosing = Data("<plist><dict><key>foo</key><string>bar</string></dict></plist></plist>".utf8)
+        XCTAssertNil(GhostSigner.extractEntitlements(fromMobileProvisionData: multiClosing))
+
+        // 5. Valid XML plist but Entitlements is non-dict
+        let nonDictCases = [
+            "<plist><dict><key>Entitlements</key><string>not-a-dict</string></dict></plist>",
+            "<plist><dict><key>Entitlements</key><array><string>item</string></array></dict></plist>",
+            "<plist><dict><key>Entitlements</key><integer>123</integer></dict></plist>",
+            "<plist><dict><key>Entitlements</key><true/></dict></plist>",
+            "<plist><dict><key>NoEntitlements</key><dict/></dict></plist>",
+            "<plist><dict/></plist>",
+            "<plist></plist>"
+        ]
+        for c in nonDictCases {
+            XCTAssertNil(GhostSigner.extractEntitlements(fromMobileProvisionData: Data(c.utf8)), "Should return nil for: \(c)")
+        }
+
+        // 6. Valid XML plist with embedded Entitlements and CDATA in values
+        let nestedInValue = """
+        <?xml version="1.0" encoding="UTF-8"?>
+        <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+        <plist version="1.0">
+        <dict>
+            <key>Entitlements</key>
+            <dict>
+                <key>nested-tags</key>
+                <string><![CDATA[</plist><plist>]]></string>
+                <key>test-key</key>
+                <string>valid-value</string>
+            </dict>
+        </dict>
+        </plist>
+        """
+        let extracted = GhostSigner.extractEntitlements(fromMobileProvisionData: Data(nestedInValue.utf8))
+        XCTAssertNotNil(extracted)
+        XCTAssertEqual(extracted?["test-key"] as? String, "valid-value")
+        XCTAssertEqual(extracted?["nested-tags"] as? String, "</plist><plist>")
+
+        // 7. Binary garbage with embedded tags placed adversarially
+        let binaryPrefix = Data((0..<256).map { UInt8($0) })
+        let binarySuffix = Data((0..<256).reversed().map { UInt8($0) })
+
+        var testBuf1 = binaryPrefix
+        testBuf1.append(Data("</plist><plist>".utf8))
+        testBuf1.append(binarySuffix)
+        XCTAssertNil(GhostSigner.extractEntitlements(fromMobileProvisionData: testBuf1))
+
+        var testBuf2 = binaryPrefix
+        testBuf2.append(Data("</plist>".utf8))
+        testBuf2.append(binarySuffix)
+        XCTAssertNil(GhostSigner.extractEntitlements(fromMobileProvisionData: testBuf2))
+
+        var testBuf3 = binaryPrefix
+        testBuf3.append(Data("<plist".utf8))
+        testBuf3.append(binarySuffix)
+        XCTAssertNil(GhostSigner.extractEntitlements(fromMobileProvisionData: testBuf3))
+
+        // 8. Deterministic pseudo-random fuzzing (5000 randomized iterations)
+        var lcg: UInt64 = 0x1234567887654321
+        func nextRand() -> UInt32 {
+            lcg = lcg &* 6364136223846793005 &+ 1442695040888963407
+            return UInt32(truncatingIfNeeded: lcg >> 32)
+        }
+
+        let tagFragments = ["<plist", "</plist>", "<plist>", "</plist><plist>", "</plist> </plist>", "<dict>", "</dict>", "<key>", "Entitlements", "\0", "\u{FF}"]
+
+        for _ in 0..<5000 {
+            let length = Int(nextRand() % 512)
+            var fuzzedData = Data((0..<length).map { _ in UInt8(nextRand() & 0xFF) })
+
+            // Inject random tags into random positions
+            let numInjections = Int(nextRand() % 4)
+            for _ in 0..<numInjections {
+                let tag = tagFragments[Int(nextRand() % UInt32(tagFragments.count))]
+                let tagData = Data(tag.utf8)
+                let insertPos = fuzzedData.isEmpty ? 0 : Int(nextRand() % UInt32(fuzzedData.count))
+                fuzzedData.insert(contentsOf: tagData, at: insertPos)
+            }
+
+            // Must execute safely without any fatalError or crash trap
+            _ = GhostSigner.extractEntitlements(fromMobileProvisionData: fuzzedData)
+        }
+    }
+
+    func testSignBundleWithProvisioningProfile() throws {
+        let tempDir = FileManager.default.temporaryDirectory
+        let appDir = tempDir.appendingPathComponent("TestAppProv_\(UUID().uuidString).app")
+        let provURL = tempDir.appendingPathComponent("test_\(UUID().uuidString).mobileprovision")
+        try FileManager.default.createDirectory(at: appDir, withIntermediateDirectories: true)
+        defer {
+            try? FileManager.default.removeItem(at: appDir)
+            try? FileManager.default.removeItem(at: provURL)
+        }
+
+        // Create Info.plist
+        let infoPlist: [String: Any] = [
+            "CFBundleExecutable": "TestApp",
+            "CFBundleIdentifier": "com.ghostcode.testapp",
+            "CFBundleVersion": "1.0"
+        ]
+        let infoData = try PropertyListSerialization.data(fromPropertyList: infoPlist, format: .xml, options: 0)
+        try infoData.write(to: appDir.appendingPathComponent("Info.plist"))
+
+        // Create main executable
+        let exeData = createMockBinary()
+        try exeData.write(to: appDir.appendingPathComponent("TestApp"))
+
+        // Create mock mobileprovision with valid plist entitlements
+        let xml = """
+        <?xml version="1.0" encoding="UTF-8"?>
+        <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+        <plist version="1.0">
+        <dict>
+            <key>Entitlements</key>
+            <dict>
+                <key>application-identifier</key>
+                <string>CUSTOMTEAM.com.ghostcode.testapp</string>
+                <key>get-task-allow</key>
+                <false/>
+            </dict>
+        </dict>
+        </plist>
+        """
+        var provData = Data([0x30, 0x82, 0x01, 0x00])
+        provData.append(Data(xml.utf8))
+        provData.append(Data([0x00, 0x01]))
+        try provData.write(to: provURL)
+
+        // Sign bundle with provisioning profile (entitlements: nil -> should extract from profile)
+        let signer = GhostSigner()
+        try signer.signBundle(
+            appURL: appDir,
+            provisioningProfileURL: provURL,
+            cert: SecCertificate(),
+            key: SecKey(),
+            entitlements: nil
+        )
+
+        // 1. Verify embedded.mobileprovision was copied to bundle root
+        let embeddedProvURL = appDir.appendingPathComponent("embedded.mobileprovision")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: embeddedProvURL.path))
+        let embeddedData = try Data(contentsOf: embeddedProvURL)
+        XCTAssertEqual(embeddedData, provData)
+
+        // 2. Verify _CodeSignature/CodeResources was created and contains embedded.mobileprovision
+        let codeResourcesURL = appDir.appendingPathComponent("_CodeSignature/CodeResources")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: codeResourcesURL.path))
+        let codeResData = try Data(contentsOf: codeResourcesURL)
+        let codeResPlist = try PropertyListSerialization.propertyList(from: codeResData, options: [], format: nil) as? [String: Any]
+        let files = codeResPlist?["files"] as? [String: Any]
+        XCTAssertNotNil(files?["embedded.mobileprovision"], "embedded.mobileprovision must be sealed in CodeResources files")
+
+        // 3. Verify main executable signature has Slot 7 with extracted entitlement
+        let reader = try MachOReader(contentsOf: appDir.appendingPathComponent("TestApp"))
+        let sigCmd = try XCTUnwrap(reader.codeSignatureCommand)
+        XCTAssertGreaterThan(sigCmd.datasize, 0)
+
+        let signedExeData = try Data(contentsOf: appDir.appendingPathComponent("TestApp"))
+        let superBlobOffset = Int(sigCmd.dataoff)
+        let superBlob = signedExeData.subdata(in: superBlobOffset..<(superBlobOffset + Int(sigCmd.datasize)))
+        let superBlobString = String(decoding: superBlob, as: UTF8.self)
+        XCTAssertTrue(superBlobString.contains("CUSTOMTEAM.com.ghostcode.testapp"), "SuperBlob must contain extracted entitlement")
+    }
 }
+

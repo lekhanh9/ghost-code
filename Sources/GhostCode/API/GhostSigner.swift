@@ -10,10 +10,12 @@ public final class GhostSigner: @unchecked Sendable {
 
     public func sign(
         binaryURL: URL,
+        identifier: String = "GhostCode",
         entitlements: [String: Any]? = nil,
         cert: SecCertificate? = nil,
         key: SecKey? = nil,
-        outputURL: URL? = nil
+        outputURL: URL? = nil,
+        isAdHoc: Bool? = nil
     ) throws {
         var binaryData: Data
         do {
@@ -22,7 +24,14 @@ public final class GhostSigner: @unchecked Sendable {
             throw MachOWriterError.fileWriteError("Failed to read binary at \(binaryURL.path): \(error.localizedDescription)")
         }
 
-        try sign(binaryData: &binaryData, entitlements: entitlements, cert: cert, key: key)
+        try sign(
+            binaryData: &binaryData,
+            identifier: identifier,
+            entitlements: entitlements,
+            cert: cert,
+            key: key,
+            isAdHoc: isAdHoc
+        )
 
         let destinationURL = outputURL ?? binaryURL
         do {
@@ -34,14 +43,24 @@ public final class GhostSigner: @unchecked Sendable {
 
     public func sign(
         binaryData: inout Data,
+        identifier: String = "GhostCode",
         entitlements: [String: Any]? = nil,
         cert: SecCertificate? = nil,
         key: SecKey? = nil,
         infoPlistData: Data? = nil,
-        resourceDirData: Data? = nil
+        resourceDirData: Data? = nil,
+        isAdHoc: Bool? = nil
     ) throws {
+        let effectiveIsAdHoc = isAdHoc ?? (cert == nil || key == nil)
+
         // 1. Determine base binary size (up to existing LC_CODE_SIGNATURE if present)
-        let codeLimit = getBaseBinarySize(from: binaryData)
+        let baseBinaryEnd = getBaseBinarySize(from: binaryData)
+        let codeLimit = (baseBinaryEnd + 15) & ~15
+
+        // If binary is smaller than codeLimit, pad with zeroes up to 16-byte boundary
+        if binaryData.count < codeLimit {
+            binaryData.append(Data(repeating: 0, count: codeLimit - binaryData.count))
+        }
 
         // 2. Encode entitlements if provided
         var xmlData: Data? = nil
@@ -52,44 +71,145 @@ public final class GhostSigner: @unchecked Sendable {
             xmlData = try PropertyListSerialization.data(fromPropertyList: entitlements, format: .xml, options: 0)
         }
 
-        // 3. Build CodeDirectory with page hashes and special slots
-        let codeDirectory = CodeDirectoryBuilder.build(
+        // PASS 1: Build initial SuperBlob to establish exact length and offsets
+        let initialCD = CodeDirectoryBuilder.build(
             binaryData: binaryData,
             codeLimit: codeLimit,
-            identifier: "GhostCode",
+            identifier: identifier,
             xmlEntitlements: xmlData,
             derEntitlements: derData,
             infoPlistData: infoPlistData,
-            resourceDirData: resourceDirData
+            resourceDirData: resourceDirData,
+            isAdHoc: effectiveIsAdHoc
         )
 
-        // 4. Generate CMS signature if cert & key are provided
-        var cmsSignature: Data? = nil
+        var initialCMS: Data? = nil
         if let cert = cert, let key = key {
-            cmsSignature = try CMSSigner.signCodeDirectory(codeDirectoryData: codeDirectory, cert: cert, key: key)
+            initialCMS = try CMSSigner.signCodeDirectory(codeDirectoryData: initialCD, cert: cert, key: key)
         }
 
-        // 5. Build SuperBlob containing CodeDirectory, XML entitlements, DER entitlements, and CMS blob
-        let superBlob = SuperBlobBuilder.build(
-            codeDirectory: codeDirectory,
+        let initialSuperBlob = SuperBlobBuilder.build(
+            codeDirectory: initialCD,
             xmlEntitlements: xmlData,
             derEntitlements: derData,
-            cmsSignature: cmsSignature
+            cmsSignature: initialCMS
         )
 
-        // 6. Inject SuperBlob into Mach-O binary
-        try MachOWriter.injectCodeSignature(into: &binaryData, signatureData: superBlob)
+        // Inject initial SuperBlob into Mach-O binary
+        // This updates Mach-O headers, increments ncmds, updates sizeofcmds & __LINKEDIT,
+        // and appends initialSuperBlob at codeLimit.
+        try MachOWriter.injectCodeSignature(into: &binaryData, signatureData: initialSuperBlob)
+
+        // PASS 2: Re-calculate CodeDirectory page hashes from modified binaryData
+        // (Page 0 hash now matches the post-injection headers and load commands)
+        let finalCD = CodeDirectoryBuilder.build(
+            binaryData: binaryData,
+            codeLimit: codeLimit,
+            identifier: identifier,
+            xmlEntitlements: xmlData,
+            derEntitlements: derData,
+            infoPlistData: infoPlistData,
+            resourceDirData: resourceDirData,
+            isAdHoc: effectiveIsAdHoc
+        )
+
+        var finalCMS: Data? = nil
+        if let cert = cert, let key = key {
+            finalCMS = try CMSSigner.signCodeDirectory(codeDirectoryData: finalCD, cert: cert, key: key)
+        }
+
+        let finalSuperBlob = SuperBlobBuilder.build(
+            codeDirectory: finalCD,
+            xmlEntitlements: xmlData,
+            derEntitlements: derData,
+            cmsSignature: finalCMS
+        )
+
+        // Overwrite the signature at the end of binaryData in-place
+        let sigOffset = binaryData.count - initialSuperBlob.count
+        if finalSuperBlob.count == initialSuperBlob.count && sigOffset >= 0 {
+            binaryData.replaceSubrange(sigOffset..<binaryData.count, with: finalSuperBlob)
+        } else {
+            try MachOWriter.injectCodeSignature(into: &binaryData, signatureData: finalSuperBlob)
+        }
     }
 
     public func signBundle(
         appURL: URL,
+        provisioningProfileURL: URL? = nil,
         cert: SecCertificate? = nil,
         key: SecKey? = nil,
         entitlements: [String: Any]? = nil
     ) throws {
         let fileManager = FileManager.default
+        let isAdHoc = (cert == nil || key == nil)
 
-        // 1. Sign nested frameworks bottom-up
+        // Handle provisioning profile if provided
+        let embeddedProvURL = appURL.appendingPathComponent("embedded.mobileprovision")
+        if let profileURL = provisioningProfileURL {
+            if fileManager.fileExists(atPath: embeddedProvURL.path) {
+                try? fileManager.removeItem(at: embeddedProvURL)
+            }
+            try fileManager.copyItem(at: profileURL, to: embeddedProvURL)
+        }
+
+        // 1. Locate Info.plist and read CFBundleIdentifier & CFBundleExecutable
+        let infoPlistURL = appURL.appendingPathComponent("Info.plist")
+        var bundleID = "GhostCode"
+        var exeName: String?
+        var infoPlistData: Data? = nil
+
+        if fileManager.fileExists(atPath: infoPlistURL.path) {
+            if let data = try? Data(contentsOf: infoPlistURL) {
+                infoPlistData = data
+                if let plist = try? PropertyListSerialization.propertyList(from: data, options: [], format: nil) as? [String: Any] {
+                    if let id = plist["CFBundleIdentifier"] as? String, !id.isEmpty {
+                        bundleID = id
+                    }
+                    if let name = plist["CFBundleExecutable"] as? String, !name.isEmpty {
+                        exeName = name
+                    }
+                }
+            }
+        }
+
+        // 2. Locate main executable URL
+        var mainExecutableURL: URL?
+        if let exeName = exeName {
+            let candidate = appURL.appendingPathComponent(exeName)
+            if fileManager.fileExists(atPath: candidate.path) {
+                mainExecutableURL = candidate
+            }
+        }
+        if mainExecutableURL == nil {
+            let appBaseName = appURL.deletingPathExtension().lastPathComponent
+            let candidate = appURL.appendingPathComponent(appBaseName)
+            if fileManager.fileExists(atPath: candidate.path) {
+                mainExecutableURL = candidate
+                exeName = appBaseName
+            }
+        }
+
+        guard let executableURL = mainExecutableURL else {
+            throw MachOWriterError.fileWriteError("Could not locate main executable in bundle at \(appURL.path)")
+        }
+
+        // 3. Determine bundle entitlements: use provided, extract from embedded.mobileprovision if nil, or default
+        let bundleEntitlements: [String: Any]
+        if let entitlements = entitlements {
+            bundleEntitlements = entitlements
+        } else if fileManager.fileExists(atPath: embeddedProvURL.path),
+                  let provData = try? Data(contentsOf: embeddedProvURL),
+                  let extracted = GhostSigner.extractEntitlements(fromMobileProvisionData: provData) {
+            bundleEntitlements = extracted
+        } else {
+            bundleEntitlements = [
+                "get-task-allow": true,
+                "application-identifier": bundleID
+            ]
+        }
+
+        // 4. Sign nested frameworks bottom-up
         let frameworksURL = appURL.appendingPathComponent("Frameworks")
         if fileManager.fileExists(atPath: frameworksURL.path) {
             let frameworkItems = try? fileManager.contentsOfDirectory(at: frameworksURL, includingPropertiesForKeys: nil)
@@ -98,66 +218,57 @@ public final class GhostSigner: @unchecked Sendable {
                     let frameworkExeName = item.deletingPathExtension().lastPathComponent
                     let frameworkExeURL = item.appendingPathComponent(frameworkExeName)
                     if fileManager.fileExists(atPath: frameworkExeURL.path) {
-                        try sign(binaryURL: frameworkExeURL, entitlements: nil, cert: cert, key: key)
+                        try sign(binaryURL: frameworkExeURL, identifier: frameworkExeName, entitlements: nil, cert: cert, key: key, isAdHoc: isAdHoc)
                     }
                 } else if item.pathExtension == "dylib" {
-                    try sign(binaryURL: item, entitlements: nil, cert: cert, key: key)
+                    let dylibName = item.deletingPathExtension().lastPathComponent
+                    try sign(binaryURL: item, identifier: dylibName, entitlements: nil, cert: cert, key: key, isAdHoc: isAdHoc)
                 }
             }
         }
 
-        // 2. Sign nested plugins
+        // 5. Sign nested plugins
         let plugInsURL = appURL.appendingPathComponent("PlugIns")
         if fileManager.fileExists(atPath: plugInsURL.path) {
             let pluginItems = try? fileManager.contentsOfDirectory(at: plugInsURL, includingPropertiesForKeys: nil)
             for item in pluginItems ?? [] where item.pathExtension == "appex" {
-                try signBundle(appURL: item, cert: cert, key: key, entitlements: entitlements)
+                try signBundle(appURL: item, cert: cert, key: key, entitlements: bundleEntitlements)
             }
         }
 
-        // 3. Generate CodeResources via BundleSealer
-        let codeResourcesData = try BundleSealer.generateCodeResources(for: appURL)
+        // 6. Generate CodeResources via BundleSealer (pass executableName to exclude it)
+        let codeResourcesData = try BundleSealer.generateCodeResources(for: appURL, executableName: exeName)
 
-        // 4. Locate main executable and Info.plist
-        let infoPlistURL = appURL.appendingPathComponent("Info.plist")
-        var mainExecutableURL: URL?
-
-        if fileManager.fileExists(atPath: infoPlistURL.path) {
-            if let data = try? Data(contentsOf: infoPlistURL),
-               let plist = try? PropertyListSerialization.propertyList(from: data, options: [], format: nil) as? [String: Any],
-               let exeName = plist["CFBundleExecutable"] as? String {
-                let candidate = appURL.appendingPathComponent(exeName)
-                if fileManager.fileExists(atPath: candidate.path) {
-                    mainExecutableURL = candidate
-                }
-            }
-        }
-
-        if mainExecutableURL == nil {
-            let appBaseName = appURL.deletingPathExtension().lastPathComponent
-            let candidate = appURL.appendingPathComponent(appBaseName)
-            if fileManager.fileExists(atPath: candidate.path) {
-                mainExecutableURL = candidate
-            }
-        }
-
-        guard let executableURL = mainExecutableURL else {
-            throw MachOWriterError.fileWriteError("Could not locate main executable in bundle at \(appURL.path)")
-        }
-
-        let infoPlistData = try? Data(contentsOf: infoPlistURL)
-
-        // 5. Sign main executable
+        // 7. Sign main executable
         var exeData = try Data(contentsOf: executableURL)
         try sign(
             binaryData: &exeData,
-            entitlements: entitlements,
+            identifier: bundleID,
+            entitlements: bundleEntitlements,
             cert: cert,
             key: key,
             infoPlistData: infoPlistData,
-            resourceDirData: codeResourcesData
+            resourceDirData: codeResourcesData,
+            isAdHoc: isAdHoc
         )
         try exeData.write(to: executableURL)
+    }
+
+    /// Extracts the Entitlements dictionary from an embedded.mobileprovision or provisioning profile data.
+    public static func extractEntitlements(fromMobileProvisionData data: Data) -> [String: Any]? {
+        guard let str = String(data: data, encoding: .isoLatin1),
+              let startRange = str.range(of: "<plist", options: .caseInsensitive),
+              let endRange = str.range(of: "</plist>", options: [.caseInsensitive, .backwards]),
+              startRange.lowerBound < endRange.upperBound else {
+            return nil
+        }
+        let xmlSubstring = str[startRange.lowerBound..<endRange.upperBound]
+        guard let xmlData = xmlSubstring.data(using: .utf8),
+              let plist = try? PropertyListSerialization.propertyList(from: xmlData, options: [], format: nil) as? [String: Any],
+              let entitlements = plist["Entitlements"] as? [String: Any] else {
+            return nil
+        }
+        return entitlements
     }
 
     private func getBaseBinarySize(from data: Data) -> Int {
