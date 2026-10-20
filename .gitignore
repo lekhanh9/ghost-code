@@ -10,8 +10,6 @@ DerivedData/
 # System & home directory files
 .*
 !.gitignore
-!.github/
-!.github/**
 LICENSE.txt
 swiftly-x86_64.tar.gz
 java
