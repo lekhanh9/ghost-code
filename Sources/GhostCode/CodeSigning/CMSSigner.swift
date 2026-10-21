@@ -24,6 +24,26 @@ public final class SecKey: @unchecked Sendable {
 #endif
 
 public enum CMSSigner {
+    /// Signs code directory data using raw in-memory Certificate and Private Key DER data (No Keychain).
+    public static func signCodeDirectory(codeDirectoryData: Data, rawCertDER: Data, rawKeyDER: Data) throws -> Data {
+        #if canImport(Security) && os(macOS)
+        guard let cert = SecCertificateCreateWithData(nil, rawCertDER as CFData) else {
+            throw CMSSignerError.configurationFailed(-1)
+        }
+        var error: Unmanaged<CFError>?
+        guard let key = SecKeyCreateWithData(rawKeyDER as CFData, [
+            kSecAttrKeyType: kSecAttrKeyTypeRSA,
+            kSecAttrKeyClass: kSecAttrKeyClassPrivate
+        ] as CFDictionary, &error) else {
+            throw CMSSignerError.configurationFailed(-2)
+        }
+        return try signCodeDirectory(codeDirectoryData: codeDirectoryData, cert: cert, key: key)
+        #else
+        // Mock detached CMS signature for Linux / cross-platform test environments
+        return mockDetachedCMS(for: codeDirectoryData)
+        #endif
+    }
+
     public static func signCodeDirectory(codeDirectoryData: Data, cert: SecCertificate, key: SecKey) throws -> Data {
         #if canImport(Security) && os(macOS)
         var encoder: CMSEncoder?

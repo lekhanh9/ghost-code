@@ -14,6 +14,8 @@ public final class GhostSigner: @unchecked Sendable {
         entitlements: [String: Any]? = nil,
         cert: SecCertificate? = nil,
         key: SecKey? = nil,
+        rawCertificate: Data? = nil,
+        rawPrivateKey: Data? = nil,
         outputURL: URL? = nil,
         isAdHoc: Bool? = nil
     ) throws {
@@ -30,6 +32,8 @@ public final class GhostSigner: @unchecked Sendable {
             entitlements: entitlements,
             cert: cert,
             key: key,
+            rawCertificate: rawCertificate,
+            rawPrivateKey: rawPrivateKey,
             isAdHoc: isAdHoc
         )
 
@@ -47,11 +51,14 @@ public final class GhostSigner: @unchecked Sendable {
         entitlements: [String: Any]? = nil,
         cert: SecCertificate? = nil,
         key: SecKey? = nil,
+        rawCertificate: Data? = nil,
+        rawPrivateKey: Data? = nil,
         infoPlistData: Data? = nil,
         resourceDirData: Data? = nil,
         isAdHoc: Bool? = nil
     ) throws {
-        let effectiveIsAdHoc = isAdHoc ?? (cert == nil || key == nil)
+        let hasRawCredentials = (rawCertificate != nil && rawPrivateKey != nil)
+        let effectiveIsAdHoc = isAdHoc ?? (!hasRawCredentials && (cert == nil || key == nil))
 
         // 1. Determine base binary size (up to existing LC_CODE_SIGNATURE if present)
         let baseBinaryEnd = getBaseBinarySize(from: binaryData)
@@ -84,7 +91,9 @@ public final class GhostSigner: @unchecked Sendable {
         )
 
         var initialCMS: Data? = nil
-        if let cert = cert, let key = key {
+        if let rawCert = rawCertificate, let rawKey = rawPrivateKey {
+            initialCMS = try CMSSigner.signCodeDirectory(codeDirectoryData: initialCD, rawCertDER: rawCert, rawKeyDER: rawKey)
+        } else if let cert = cert, let key = key {
             initialCMS = try CMSSigner.signCodeDirectory(codeDirectoryData: initialCD, cert: cert, key: key)
         }
 
@@ -114,7 +123,9 @@ public final class GhostSigner: @unchecked Sendable {
         )
 
         var finalCMS: Data? = nil
-        if let cert = cert, let key = key {
+        if let rawCert = rawCertificate, let rawKey = rawPrivateKey {
+            finalCMS = try CMSSigner.signCodeDirectory(codeDirectoryData: finalCD, rawCertDER: rawCert, rawKeyDER: rawKey)
+        } else if let cert = cert, let key = key {
             finalCMS = try CMSSigner.signCodeDirectory(codeDirectoryData: finalCD, cert: cert, key: key)
         }
 
@@ -139,10 +150,13 @@ public final class GhostSigner: @unchecked Sendable {
         provisioningProfileURL: URL? = nil,
         cert: SecCertificate? = nil,
         key: SecKey? = nil,
+        rawCertificate: Data? = nil,
+        rawPrivateKey: Data? = nil,
         entitlements: [String: Any]? = nil
     ) throws {
         let fileManager = FileManager.default
-        let isAdHoc = (cert == nil || key == nil)
+        let hasRawCredentials = (rawCertificate != nil && rawPrivateKey != nil)
+        let isAdHoc = !hasRawCredentials && (cert == nil || key == nil)
 
         // Handle provisioning profile if provided
         let embeddedProvURL = appURL.appendingPathComponent("embedded.mobileprovision")
@@ -218,11 +232,11 @@ public final class GhostSigner: @unchecked Sendable {
                     let frameworkExeName = item.deletingPathExtension().lastPathComponent
                     let frameworkExeURL = item.appendingPathComponent(frameworkExeName)
                     if fileManager.fileExists(atPath: frameworkExeURL.path) {
-                        try sign(binaryURL: frameworkExeURL, identifier: frameworkExeName, entitlements: nil, cert: cert, key: key, isAdHoc: isAdHoc)
+                        try sign(binaryURL: frameworkExeURL, identifier: frameworkExeName, entitlements: nil, cert: cert, key: key, rawCertificate: rawCertificate, rawPrivateKey: rawPrivateKey, isAdHoc: isAdHoc)
                     }
                 } else if item.pathExtension == "dylib" {
                     let dylibName = item.deletingPathExtension().lastPathComponent
-                    try sign(binaryURL: item, identifier: dylibName, entitlements: nil, cert: cert, key: key, isAdHoc: isAdHoc)
+                    try sign(binaryURL: item, identifier: dylibName, entitlements: nil, cert: cert, key: key, rawCertificate: rawCertificate, rawPrivateKey: rawPrivateKey, isAdHoc: isAdHoc)
                 }
             }
         }
@@ -232,7 +246,7 @@ public final class GhostSigner: @unchecked Sendable {
         if fileManager.fileExists(atPath: plugInsURL.path) {
             let pluginItems = try? fileManager.contentsOfDirectory(at: plugInsURL, includingPropertiesForKeys: nil)
             for item in pluginItems ?? [] where item.pathExtension == "appex" {
-                try signBundle(appURL: item, cert: cert, key: key, entitlements: bundleEntitlements)
+                try signBundle(appURL: item, cert: cert, key: key, rawCertificate: rawCertificate, rawPrivateKey: rawPrivateKey, entitlements: bundleEntitlements)
             }
         }
 
@@ -247,6 +261,8 @@ public final class GhostSigner: @unchecked Sendable {
             entitlements: bundleEntitlements,
             cert: cert,
             key: key,
+            rawCertificate: rawCertificate,
+            rawPrivateKey: rawPrivateKey,
             infoPlistData: infoPlistData,
             resourceDirData: codeResourcesData,
             isAdHoc: isAdHoc
