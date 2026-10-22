@@ -1,6 +1,6 @@
 import Foundation
 
-#if canImport(Security) && os(macOS)
+#if canImport(Security)
 import Security
 #endif
 
@@ -56,7 +56,7 @@ public enum PEMHelper {
         guard let der = decodeFirst(from: data, tag: "CERTIFICATE") else {
             return nil
         }
-        #if canImport(Security) && os(macOS)
+        #if canImport(Security)
         if let cert = SecCertificateCreateWithData(nil, der as CFData) {
             return cert
         }
@@ -71,7 +71,7 @@ public enum PEMHelper {
         guard let der = decodeFirst(from: data, tag: "KEY") else {
             return nil
         }
-        #if canImport(Security) && os(macOS)
+        #if canImport(Security)
         let keyDict: [String: Any] = [
             kSecAttrKeyType as String: kSecAttrKeyTypeRSA,
             kSecAttrKeyClass as String: kSecAttrKeyClassPrivate
