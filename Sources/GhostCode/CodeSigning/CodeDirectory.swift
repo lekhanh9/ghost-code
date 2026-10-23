@@ -3,6 +3,8 @@ import Foundation
 import CryptoKit
 #endif
 
+private typealias CS = GhostCodeConstants.CodeSigning
+
 @frozen
 public struct CodeDirectory: Sendable, Equatable {
     public var magic: UInt32         // 0xfade0c02
@@ -16,9 +18,21 @@ public struct CodeDirectory: Sendable, Equatable {
     public var codeLimit: UInt32     // Limit of binary covered by code signature
     public var hashSize: UInt8       // Size of each hash in bytes (32 for SHA-256)
     public var hashType: UInt8       // Type of hash (2 for SHA-256)
-    public var platform: UInt8       // Platform identifier (0)
+    public var platform: UInt8       // Platform identifier (0); `spare1` in Apple's header
     public var pageSize: UInt8       // Log2(page size) (12 => 4096 bytes)
     public var spare2: UInt32        // Unused (must be zero)
+
+    /// >= 0x20100. Zero until scatter blobs are emitted.
+    public var scatterOffset: UInt32
+    /// >= 0x20200. Offset of the NUL-terminated team string, or zero when absent.
+    public var teamOffset: UInt32
+    /// >= 0x20300.
+    public var spare3: UInt32
+    public var codeLimit64: UInt64
+    /// >= 0x20400.
+    public var execSegBase: UInt64
+    public var execSegLimit: UInt64
+    public var execSegFlags: UInt64
 
     public init(
         magic: UInt32 = MachOConstants.CSMAGIC_CODEDIRECTORY,
@@ -34,7 +48,14 @@ public struct CodeDirectory: Sendable, Equatable {
         hashType: UInt8 = MachOConstants.CS_HASHTYPE_SHA256,
         platform: UInt8 = 0,
         pageSize: UInt8 = 12,
-        spare2: UInt32 = 0
+        spare2: UInt32 = 0,
+        scatterOffset: UInt32 = 0,
+        teamOffset: UInt32 = 0,
+        spare3: UInt32 = 0,
+        codeLimit64: UInt64 = 0,
+        execSegBase: UInt64 = 0,
+        execSegLimit: UInt64 = 0,
+        execSegFlags: UInt64 = 0
     ) {
         self.magic = magic
         self.length = length
@@ -50,6 +71,32 @@ public struct CodeDirectory: Sendable, Equatable {
         self.platform = platform
         self.pageSize = pageSize
         self.spare2 = spare2
+        self.scatterOffset = scatterOffset
+        self.teamOffset = teamOffset
+        self.spare3 = spare3
+        self.codeLimit64 = codeLimit64
+        self.execSegBase = execSegBase
+        self.execSegLimit = execSegLimit
+        self.execSegFlags = execSegFlags
+    }
+
+    /// The header is version-gated: a verifier sizes everything after it from `version`, so writing
+    /// fewer bytes than this returns makes the identifier string be parsed as the extension fields.
+    public static func headerLength(version: UInt32) -> Int {
+        var length = CS.CS_CODEDIRECTORY_BASE_HEADER_SIZE
+        if version >= CS.CS_SUPPORTSSCATTER {
+            length += 4 // scatterOffset
+        }
+        if version >= CS.CS_SUPPORTSTEAMID {
+            length += 4 // teamOffset
+        }
+        if version >= CS.CS_SUPPORTS64BITLIMIT {
+            length += 4 + 8 // spare3 + codeLimit64
+        }
+        if version >= CS.CS_SUPPORTSEXECSEG {
+            length += 8 + 8 + 8 // execSegBase + execSegLimit + execSegFlags
+        }
+        return length
     }
 }
 
@@ -65,28 +112,71 @@ public struct CodeDirectoryBuilder {
         derEntitlements: Data? = nil,
         infoPlistData: Data? = nil,
         resourceDirData: Data? = nil,
+        teamID: String? = nil,
+        execSegLimit: UInt64 = 0,
+        isExecutableImage: Bool = false,
+        getTaskAllow: Bool = false,
         isAdHoc: Bool = true
     ) -> Data {
+        let version: UInt32 = CS.CS_SUPPORTSEXECSEG
         let actualCodeLimit = min(codeLimit ?? binaryData.count, binaryData.count)
         let pageSize = defaultPageSize
         let nCodeSlots = (actualCodeLimit + pageSize - 1) / pageSize
 
-        // Slots:
-        // Slot -1 = CSSLOT_INFOPLIST
-        // Slot -3 = CSSLOT_RESOURCEDIR
-        // Slot -5 = CSSLOT_ENTITLEMENTS (XML)
-        // Slot -7 = CSSLOT_DER_ENTITLEMENTS (DER)
-        let nSpecialSlots: UInt32 = (derEntitlements != nil) ? 7 : ((xmlEntitlements != nil) ? 5 : ((resourceDirData != nil) ? 3 : 7))
+        let hashSize: Int = CS.CS_HASHSIZE_SHA256
+        let emptyHash = Data(repeating: 0, count: hashSize)
 
-        let hashSize: Int = 32 // SHA-256
-        let headerSize = 44
+        // Special slots have negative indexes; slot -k is stored at index (nSpecialSlots - k).
+        // Listed here from the most negative to -1 so unused high slots can be trimmed off the front.
+        var specialSlots: [Data] = [
+            derEntitlements.map(sha256) ?? emptyHash,  // -7 CSSLOT_DER_ENTITLEMENTS
+            emptyHash,                                 // -6 reserved
+            xmlEntitlements.map(sha256) ?? emptyHash,  // -5 CSSLOT_ENTITLEMENTS
+            emptyHash,                                 // -4 reserved
+            resourceDirData.map(sha256) ?? emptyHash,  // -3 CSSLOT_RESOURCEDIR
+            emptyHash,                                 // -2 CSSLOT_REQUIREMENTS
+            infoPlistData.map(sha256) ?? emptyHash    // -1 CSSLOT_INFOPLIST
+        ]
+        if let firstUsed = specialSlots.firstIndex(where: { $0 != emptyHash }) {
+            specialSlots.removeSubrange(0..<firstUsed)
+        } else {
+            specialSlots.removeAll()
+        }
 
+        var flags: UInt32 = 0
+        if xmlEntitlements != nil || derEntitlements != nil {
+            flags |= CS.CS_ENTITLEMENTS_VALIDATED
+        }
+        if isAdHoc {
+            flags |= CS.CS_ADHOC
+        }
+        if getTaskAllow {
+            flags |= CS.CS_GET_TASK_ALLOW
+        }
+
+        var execSegFlags: UInt64 = 0
+        if isExecutableImage {
+            execSegFlags |= CS.CS_EXECSEG_MAIN_BINARY
+        }
+        if getTaskAllow {
+            execSegFlags |= CS.CS_EXECSEG_ALLOW_UNSIGNED
+        }
+
+        let headerSize = CodeDirectory.headerLength(version: version)
         let identOffset = headerSize
         let identBytes = Data(identifier.utf8) + Data([0x00])
 
-        let specialSlotsOffset = identOffset + identBytes.count
-        let specialSlotsByteCount = Int(nSpecialSlots) * hashSize
-        let hashOffset = specialSlotsOffset + specialSlotsByteCount
+        var teamBytes: Data? = nil
+        if let teamID, !teamID.isEmpty {
+            teamBytes = Data(teamID.utf8) + Data([0x00])
+        }
+        let teamOffset = teamBytes.map { _ in UInt32(identOffset + identBytes.count) } ?? 0
+
+        let specialSlotsByteCount = specialSlots.count * hashSize
+        let hashOffset = identOffset
+            + identBytes.count
+            + (teamBytes?.count ?? 0)
+            + specialSlotsByteCount
 
         let codeSlotsByteCount = nCodeSlots * hashSize
         let totalLength = hashOffset + codeSlotsByteCount
@@ -94,18 +184,25 @@ public struct CodeDirectoryBuilder {
         let header = CodeDirectory(
             magic: MachOConstants.CSMAGIC_CODEDIRECTORY,
             length: UInt32(totalLength),
-            version: 0x20400,
-            flags: isAdHoc ? 0x20002 : 0x20000,
+            version: version,
+            flags: flags,
             hashOffset: UInt32(hashOffset),
             identOffset: UInt32(identOffset),
-            nSpecialSlots: nSpecialSlots,
+            nSpecialSlots: UInt32(specialSlots.count),
             nCodeSlots: UInt32(nCodeSlots),
             codeLimit: UInt32(actualCodeLimit),
             hashSize: UInt8(hashSize),
             hashType: MachOConstants.CS_HASHTYPE_SHA256,
             platform: 0,
             pageSize: defaultPageSizeExponent,
-            spare2: 0
+            spare2: 0,
+            scatterOffset: 0,
+            teamOffset: teamOffset,
+            spare3: 0,
+            codeLimit64: 0,
+            execSegBase: 0,
+            execSegLimit: execSegLimit,
+            execSegFlags: execSegFlags
         )
 
         var blob = Data()
@@ -123,47 +220,28 @@ public struct CodeDirectoryBuilder {
         blob.append(header.platform)
         blob.append(header.pageSize)
         appendBigEndian(header.spare2, to: &blob)
+        appendBigEndian(header.scatterOffset, to: &blob)
+        appendBigEndian(header.teamOffset, to: &blob)
+        appendBigEndian(header.spare3, to: &blob)
+        appendBigEndian(header.codeLimit64, to: &blob)
+        appendBigEndian(header.execSegBase, to: &blob)
+        appendBigEndian(header.execSegLimit, to: &blob)
+        appendBigEndian(header.execSegFlags, to: &blob)
 
-        // Identifier string
         blob.append(identBytes)
-
-        // Special slots buffer: nSpecialSlots * 32 bytes
-        // Slot -k is stored at: (nSpecialSlots - k) * 32
-        var specialSlotsData = Data(repeating: 0, count: specialSlotsByteCount)
-
-        if let info = infoPlistData, nSpecialSlots >= 1 {
-            let digest = sha256(info)
-            let offset = Int(nSpecialSlots - 1) * hashSize
-            specialSlotsData.replaceSubrange(offset..<(offset + hashSize), with: digest)
+        if let teamBytes {
+            blob.append(teamBytes)
+        }
+        for slot in specialSlots {
+            blob.append(slot)
         }
 
-        if let res = resourceDirData, nSpecialSlots >= 3 {
-            let digest = sha256(res)
-            let offset = Int(nSpecialSlots - 3) * hashSize
-            specialSlotsData.replaceSubrange(offset..<(offset + hashSize), with: digest)
-        }
-
-        if let xml = xmlEntitlements, nSpecialSlots >= 5 {
-            let digest = sha256(xml)
-            let offset = Int(nSpecialSlots - 5) * hashSize
-            specialSlotsData.replaceSubrange(offset..<(offset + hashSize), with: digest)
-        }
-
-        if let der = derEntitlements, nSpecialSlots >= 7 {
-            let digest = sha256(der)
-            let offset = Int(nSpecialSlots - 7) * hashSize
-            specialSlotsData.replaceSubrange(offset..<(offset + hashSize), with: digest)
-        }
-
-        blob.append(specialSlotsData)
-
-        // Code slots: hash each 4096-byte page of binary up to codeLimit
+        // Code slots: hash each page of binary up to codeLimit
         for slotIndex in 0..<nCodeSlots {
             let start = slotIndex * pageSize
             let end = min(start + pageSize, actualCodeLimit)
             let pageSlice = binaryData.subdata(in: start..<end)
-            let digest = sha256(pageSlice)
-            blob.append(digest)
+            blob.append(sha256(pageSlice))
         }
 
         return blob

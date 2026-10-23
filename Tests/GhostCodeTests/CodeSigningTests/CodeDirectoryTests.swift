@@ -57,4 +57,155 @@ final class CodeDirectoryTests: XCTestCase {
         let expectedPage0Hash = CodeDirectoryBuilder.sha256(dummyBinary.subdata(in: 0..<4096))
         XCTAssertEqual(codeSlot0, expectedPage0Hash)
     }
+
+    // MARK: - 0x20400 header layout
+
+    private func bigEndian32(_ data: Data, at offset: Int) -> UInt32 {
+        data.withUnsafeBytes { UInt32(bigEndian: $0.loadUnaligned(fromByteOffset: offset, as: UInt32.self)) }
+    }
+
+    private func bigEndian64(_ data: Data, at offset: Int) -> UInt64 {
+        data.withUnsafeBytes { UInt64(bigEndian: $0.loadUnaligned(fromByteOffset: offset, as: UInt64.self)) }
+    }
+
+    private func buildCD(
+        identifier: String = "com.example.test",
+        teamID: String? = nil,
+        xml: Data? = nil,
+        der: Data? = nil,
+        infoPlist: Data? = nil,
+        resourceDir: Data? = nil,
+        execSegLimit: UInt64 = 0,
+        isExecutableImage: Bool = false,
+        getTaskAllow: Bool = false,
+        isAdHoc: Bool = true
+    ) -> Data {
+        CodeDirectoryBuilder.build(
+            binaryData: Data(repeating: 0x90, count: 8192),
+            codeLimit: 8192,
+            identifier: identifier,
+            xmlEntitlements: xml,
+            derEntitlements: der,
+            infoPlistData: infoPlist,
+            resourceDirData: resourceDir,
+            teamID: teamID,
+            execSegLimit: execSegLimit,
+            isExecutableImage: isExecutableImage,
+            getTaskAllow: getTaskAllow,
+            isAdHoc: isAdHoc
+        )
+    }
+
+    func testHeaderLengthIsVersionGated() {
+        XCTAssertEqual(CodeDirectory.headerLength(version: 0x20000), 44)
+        XCTAssertEqual(CodeDirectory.headerLength(version: 0x20100), 48)
+        XCTAssertEqual(CodeDirectory.headerLength(version: 0x20200), 52)
+        XCTAssertEqual(CodeDirectory.headerLength(version: 0x20300), 64)
+        XCTAssertEqual(CodeDirectory.headerLength(version: 0x20400), 88)
+    }
+
+    func testIdentOffsetFollowsFull88ByteHeader() {
+        let cd = buildCD(xml: Data("<plist></plist>".utf8), der: Data([0x30, 0x05, 0x01, 0x01, 0xFF]))
+
+        XCTAssertEqual(bigEndian32(cd, at: 8), 0x20400, "version")
+        XCTAssertEqual(bigEndian32(cd, at: 20), 88, "identOffset must sit past every version-gated field")
+        XCTAssertEqual(bigEndian32(cd, at: 48), 0, "teamOffset stays zero without a team")
+        XCTAssertEqual(bigEndian64(cd, at: 56), 0, "codeLimit64")
+        XCTAssertEqual(bigEndian32(cd, at: 52), 0, "spare3")
+
+        // Identifier is the 17 bytes starting at 88 ("com.example.test" + NUL)
+        XCTAssertEqual(String(decoding: cd.subdata(in: 88..<104), as: UTF8.self), "com.example.test")
+        XCTAssertEqual(cd[104], 0)
+
+        let nSpecialSlots = bigEndian32(cd, at: 24)
+        XCTAssertEqual(bigEndian32(cd, at: 16), 88 + 17 + nSpecialSlots * 32, "hashOffset")
+        XCTAssertEqual(bigEndian32(cd, at: 4), UInt32(cd.count), "length must cover the whole blob")
+    }
+
+    func testTeamStringIsWrittenBetweenIdentifierAndSlots() {
+        let cd = buildCD(teamID: "ABCDE12345", xml: Data("<plist></plist>".utf8))
+
+        let identOffset = bigEndian32(cd, at: 20)
+        let teamOffset = bigEndian32(cd, at: 48)
+        XCTAssertEqual(teamOffset, identOffset + 17, "team string starts right after the NUL-terminated identifier")
+
+        let teamBytes = cd.subdata(in: Int(teamOffset)..<(Int(teamOffset) + 11))
+        XCTAssertEqual(String(decoding: teamBytes.prefix(10), as: UTF8.self), "ABCDE12345")
+        XCTAssertEqual(teamBytes[10], 0)
+
+        XCTAssertEqual(bigEndian32(cd, at: 16), teamOffset + 11 + bigEndian32(cd, at: 24) * 32, "hashOffset skips the team string")
+    }
+
+    func testUnusedSpecialSlotsAreTrimmedFromTheFront() {
+        // Only Info.plist (-1): six more-negative slots are unused, so nSpecialSlots collapses to 1.
+        let plistOnly = buildCD(infoPlist: Data("plist".utf8))
+        XCTAssertEqual(bigEndian32(plistOnly, at: 24), 1)
+        let plistSlot = plistOnly.subdata(in: Int(bigEndian32(plistOnly, at: 16) - 32)..<Int(bigEndian32(plistOnly, at: 16)))
+        XCTAssertEqual(plistSlot, CodeDirectoryBuilder.sha256(Data("plist".utf8)))
+
+        // XML entitlements (-5) plus the reserved -6/-4 gaps: 5 slots kept.
+        let xmlOnly = buildCD(xml: Data("<plist></plist>".utf8))
+        XCTAssertEqual(bigEndian32(xmlOnly, at: 24), 5)
+
+        // DER entitlements (-7) pins the full window even though -6..-1 are empty.
+        let derOnly = buildCD(der: Data([0x30, 0x05, 0x01, 0x01, 0xFF]))
+        XCTAssertEqual(bigEndian32(derOnly, at: 24), 7)
+
+        // Nothing sealed at all: no special slot region.
+        let bare = buildCD()
+        XCTAssertEqual(bigEndian32(bare, at: 24), 0)
+        XCTAssertEqual(bigEndian32(bare, at: 16), 88 + 17)
+    }
+
+    func testExecSegFieldsRoundTrip() {
+        let cd = buildCD(teamID: "ABCDE12345", execSegLimit: 0x4000, isExecutableImage: true, getTaskAllow: true)
+
+        XCTAssertEqual(bigEndian64(cd, at: 64), 0, "execSegBase")
+        XCTAssertEqual(bigEndian64(cd, at: 72), 0x4000, "execSegLimit")
+        XCTAssertEqual(
+            bigEndian64(cd, at: 80),
+            GhostCodeConstants.CodeSigning.CS_EXECSEG_MAIN_BINARY | GhostCodeConstants.CodeSigning.CS_EXECSEG_ALLOW_UNSIGNED
+        )
+        XCTAssertEqual(
+            bigEndian32(cd, at: 12) & GhostCodeConstants.CodeSigning.CS_GET_TASK_ALLOW,
+            GhostCodeConstants.CodeSigning.CS_GET_TASK_ALLOW
+        )
+    }
+
+    func testFlagsOnlyClaimWhatIsActuallySigned() {
+        XCTAssertEqual(bigEndian32(buildCD(), at: 12), GhostCodeConstants.CodeSigning.CS_ADHOC)
+
+        let adHocWithEntitlements = buildCD(xml: Data("<plist></plist>".utf8))
+        XCTAssertEqual(
+            bigEndian32(adHocWithEntitlements, at: 12),
+            GhostCodeConstants.CodeSigning.CS_ENTITLEMENTS_VALIDATED | GhostCodeConstants.CodeSigning.CS_ADHOC
+        )
+
+        let realSignatureWithTaskAllow = buildCD(xml: Data("<plist></plist>".utf8), getTaskAllow: true, isAdHoc: false)
+        XCTAssertEqual(
+            bigEndian32(realSignatureWithTaskAllow, at: 12),
+            GhostCodeConstants.CodeSigning.CS_ENTITLEMENTS_VALIDATED | GhostCodeConstants.CodeSigning.CS_GET_TASK_ALLOW
+        )
+    }
+
+    func testDistributionProfileKeepsGetTaskAllowClear() {
+        let cd = buildCD(xml: Data("<plist></plist>".utf8), getTaskAllow: false)
+        XCTAssertEqual(bigEndian32(cd, at: 12) & GhostCodeConstants.CodeSigning.CS_GET_TASK_ALLOW, 0)
+        XCTAssertEqual(bigEndian64(cd, at: 80) & GhostCodeConstants.CodeSigning.CS_EXECSEG_ALLOW_UNSIGNED, 0)
+    }
+
+    func testCodeSlotsStartAtDeclaredHashOffset() {
+        let binary = Data(repeating: 0x90, count: 8192)
+        let cd = CodeDirectoryBuilder.build(
+            binaryData: binary,
+            codeLimit: 8192,
+            identifier: "com.example.a",
+            teamID: "TEAM"
+        )
+        let hashOffset = Int(bigEndian32(cd, at: 16))
+        XCTAssertEqual(bigEndian32(cd, at: 28), 2, "nCodeSlots")
+        XCTAssertEqual(cd.subdata(in: hashOffset..<(hashOffset + 32)), CodeDirectoryBuilder.sha256(binary.subdata(in: 0..<4096)))
+        let lastPage = binary.subdata(in: 4096..<8192)
+        XCTAssertEqual(cd.subdata(in: (hashOffset + 32)..<(hashOffset + 64)), CodeDirectoryBuilder.sha256(lastPage))
+    }
 }

@@ -1,6 +1,8 @@
 import XCTest
 @testable import GhostCode
 
+private struct MissingCodeDirectoryError: Error {}
+
 final class GhostSignerTests: XCTestCase {
     private func createMockBinary() -> Data {
         var data = Data()
@@ -416,6 +418,175 @@ final class GhostSignerTests: XCTestCase {
         let superBlob = signedExeData.subdata(in: superBlobOffset..<(superBlobOffset + Int(sigCmd.datasize)))
         let superBlobString = String(decoding: superBlob, as: UTF8.self)
         XCTAssertTrue(superBlobString.contains("CUSTOMTEAM.com.ghostcode.testapp"), "SuperBlob must contain extracted entitlement")
+    }
+
+    // MARK: - TeamIdentifier extraction
+
+    private func mockProfile(_ xml: String) -> Data {
+        var data = Data([0x30, 0x82, 0x01, 0x00])
+        data.append(Data(xml.utf8))
+        data.append(Data([0x00, 0x01]))
+        return data
+    }
+
+    /// Pulls the CSSLOT_CODEDIRECTORY blob out of an embedded superblob.
+    private func codeDirectory(from superBlob: Data) throws -> Data {
+        let count = Int(UInt32(bigEndian: superBlob.withUnsafeBytes { $0.loadUnaligned(fromByteOffset: 8, as: UInt32.self) }))
+        for index in 0..<count {
+            let entry = 12 + index * 8
+            let slot = UInt32(bigEndian: superBlob.withUnsafeBytes { $0.loadUnaligned(fromByteOffset: entry, as: UInt32.self) })
+            let offset = Int(UInt32(bigEndian: superBlob.withUnsafeBytes { $0.loadUnaligned(fromByteOffset: entry + 4, as: UInt32.self) }))
+            guard slot == MachOConstants.CSSLOT_CODEDIRECTORY else { continue }
+            let length = Int(UInt32(bigEndian: superBlob.withUnsafeBytes { $0.loadUnaligned(fromByteOffset: offset + 4, as: UInt32.self) }))
+            return superBlob.subdata(in: offset..<min(offset + length, superBlob.count))
+        }
+        throw MissingCodeDirectoryError()
+    }
+
+    func testExtractTeamIdentifierPrefersProfileArray() {
+        let xml = """
+        <?xml version="1.0" encoding="UTF-8"?>
+        <plist version="1.0">
+        <dict>
+            <key>TeamIdentifier</key>
+            <array>
+                <string>TEAMFROMPROFILE</string>
+                <string>QWERTYUIOP</string>
+            </array>
+            <key>Entitlements</key>
+            <dict>
+                <key>com.apple.developer.team-identifier</key>
+                <string>TEAMFROMENTITLEMENT</string>
+            </dict>
+        </dict>
+        </plist>
+        """
+        XCTAssertEqual(
+            GhostSigner.extractTeamIdentifier(fromMobileProvisionData: mockProfile(xml)),
+            "TEAMFROMPROFILE",
+            "TeamIdentifier[0] is authoritative over the mirrored entitlement"
+        )
+    }
+
+    func testExtractTeamIdentifierFallsBackToEntitlement() {
+        let xml = """
+        <?xml version="1.0" encoding="UTF-8"?>
+        <plist version="1.0">
+        <dict>
+            <key>Entitlements</key>
+            <dict>
+                <key>com.apple.developer.team-identifier</key>
+                <string>ENTITLETEAM</string>
+            </dict>
+        </dict>
+        </plist>
+        """
+        XCTAssertEqual(GhostSigner.extractTeamIdentifier(fromMobileProvisionData: mockProfile(xml)), "ENTITLETEAM")
+    }
+
+    func testExtractTeamIdentifierNilWhenAbsent() {
+        XCTAssertNil(GhostSigner.extractTeamIdentifier(fromMobileProvisionData: mockProfile("""
+        <plist version="1.0"><dict><key>Name</key><string>x</string></dict></plist>
+        """)))
+        XCTAssertNil(GhostSigner.extractTeamIdentifier(fromMobileProvisionData: Data("not a profile".utf8)))
+    }
+
+    func testSignedBinaryWritesTeamInto88ByteHeader() throws {
+        let binaryData = createMockBinary()
+        let signer = GhostSigner()
+        var signed = binaryData
+        try signer.sign(
+            binaryData: &signed,
+            identifier: "com.ghostcode.teamtest",
+            entitlements: ["get-task-allow": true],
+            teamID: "ABCDE12345"
+        )
+
+        let reader = try MachOReader(data: signed)
+        let sigCmd = try XCTUnwrap(reader.codeSignatureCommand)
+        let superBlobStart = Int(sigCmd.dataoff)
+        let superBlob = signed.subdata(in: superBlobStart..<(superBlobStart + Int(sigCmd.datasize)))
+        let cd = try codeDirectory(from: superBlob)
+
+        func be32(_ offset: Int) -> UInt32 {
+            UInt32(bigEndian: cd.withUnsafeBytes { $0.loadUnaligned(fromByteOffset: offset, as: UInt32.self) })
+        }
+        func be64(_ offset: Int) -> UInt64 {
+            UInt64(bigEndian: cd.withUnsafeBytes { $0.loadUnaligned(fromByteOffset: offset, as: UInt64.self) })
+        }
+
+        XCTAssertEqual(be32(8), 0x20400)
+        XCTAssertEqual(be32(20), 88, "identOffset")
+        XCTAssertEqual(be32(48), UInt32(88 + "com.ghostcode.teamtest".count + 1), "teamOffset")
+        XCTAssertEqual(be64(72), 4096, "execSegLimit is __TEXT vmsize")
+        XCTAssertEqual(be64(80), 0x11, "MH_EXECUTE + get-task-allow")
+        let teamStart = Int(be32(48))
+        XCTAssertEqual(String(decoding: cd.subdata(in: teamStart..<(teamStart + 10)), as: UTF8.self), "ABCDE12345")
+    }
+
+    func testSignBundleWritesTeamAndProfileTaskAllowFromProfile() throws {
+        let tempDir = FileManager.default.temporaryDirectory
+        let appDir = tempDir.appendingPathComponent("TestAppTeam_\(UUID().uuidString).app")
+        let provURL = tempDir.appendingPathComponent("team_\(UUID().uuidString).mobileprovision")
+        try FileManager.default.createDirectory(at: appDir, withIntermediateDirectories: true)
+        defer {
+            try? FileManager.default.removeItem(at: appDir)
+            try? FileManager.default.removeItem(at: provURL)
+        }
+
+        let infoPlist: [String: Any] = [
+            "CFBundleExecutable": "TestApp",
+            "CFBundleIdentifier": "com.ghostcode.teamapp",
+            "CFBundleVersion": "1.0"
+        ]
+        let infoData = try PropertyListSerialization.data(fromPropertyList: infoPlist, format: .xml, options: 0)
+        try infoData.write(to: appDir.appendingPathComponent("Info.plist"))
+        try createMockBinary().write(to: appDir.appendingPathComponent("TestApp"))
+
+        let xml = """
+        <?xml version="1.0" encoding="UTF-8"?>
+        <plist version="1.0">
+        <dict>
+            <key>TeamIdentifier</key>
+            <array><string>PROFILETEAM</string></array>
+            <key>Entitlements</key>
+            <dict>
+                <key>application-identifier</key>
+                <string>PROFILETEAM.com.ghostcode.teamapp</string>
+                <key>get-task-allow</key>
+                <false/>
+            </dict>
+        </dict>
+        </plist>
+        """
+        try mockProfile(xml).write(to: provURL)
+
+        let signer = GhostSigner()
+        try signer.signBundle(
+            appURL: appDir,
+            provisioningProfileURL: provURL,
+            cert: SecCertificate(),
+            key: SecKey(),
+            entitlements: nil
+        )
+
+        let exeURL = appDir.appendingPathComponent("TestApp")
+        let signed = try Data(contentsOf: exeURL)
+        let reader = try MachOReader(data: signed)
+        let sigCmd = try XCTUnwrap(reader.codeSignatureCommand)
+        let superBlobStart = Int(sigCmd.dataoff)
+        let superBlob = signed.subdata(in: superBlobStart..<(superBlobStart + Int(sigCmd.datasize)))
+        let cd = try codeDirectory(from: superBlob)
+
+        func be32(_ offset: Int) -> UInt32 {
+            UInt32(bigEndian: cd.withUnsafeBytes { $0.loadUnaligned(fromByteOffset: offset, as: UInt32.self) })
+        }
+
+        XCTAssertEqual(be32(20), 88, "identOffset")
+        let teamOffset = Int(be32(48))
+        XCTAssertGreaterThan(teamOffset, 0, "distribution profile must yield a teamOffset")
+        XCTAssertEqual(String(decoding: cd.subdata(in: teamOffset..<(teamOffset + 11)), as: UTF8.self), "PROFILETEAM")
+        XCTAssertEqual(be32(12), GhostCodeConstants.CodeSigning.CS_ENTITLEMENTS_VALIDATED, "profile with get-task-allow false must not set the adhoc or task-allow bits")
     }
 }
 

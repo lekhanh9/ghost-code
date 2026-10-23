@@ -299,8 +299,12 @@ func main() {
             } else {
                 print("Signing binary: \(targetURL.path)...")
                 var binaryEntitlements = entitlements
-                if binaryEntitlements == nil, let pURL = provURL, let pData = try? Data(contentsOf: pURL) {
-                    binaryEntitlements = GhostSigner.extractEntitlements(fromMobileProvisionData: pData)
+                var binaryTeamID: String? = nil
+                if let pURL = provURL, let pData = try? Data(contentsOf: pURL) {
+                    if binaryEntitlements == nil {
+                        binaryEntitlements = GhostSigner.extractEntitlements(fromMobileProvisionData: pData)
+                    }
+                    binaryTeamID = GhostSigner.extractTeamIdentifier(fromMobileProvisionData: pData)
                 }
                 let outURL = args.outputPath.map { URL(fileURLWithPath: $0) }
                 try signer.sign(
@@ -308,6 +312,7 @@ func main() {
                     entitlements: binaryEntitlements,
                     cert: cert,
                     key: key,
+                    teamID: binaryTeamID,
                     outputURL: outURL,
                     isAdHoc: args.adhoc ? true : (cert == nil || key == nil)
                 )

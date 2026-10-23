@@ -34,6 +34,24 @@ public final class MachOReader: @unchecked Sendable {
         }
     }
 
+    /// `__TEXT` vmsize, which becomes the CodeDirectory's `execSegLimit`.
+    public var textSegmentVMSize: UInt64? {
+        // segment_command_64 payload: segname[16], vmaddr(8), vmsize(8), ...
+        commands.first { command in
+            guard command.cmd == MachOConstants.LC_SEGMENT_64, command.payload.count >= 32 else {
+                return false
+            }
+            let name = command.payload.subdata(in: 0..<16)
+            return String(decoding: name.prefix(while: { $0 != 0 }), as: UTF8.self) == "__TEXT"
+        }?.payload.withUnsafeBytes { raw in
+            raw.loadUnaligned(fromByteOffset: 24, as: UInt64.self).littleEndian
+        }
+    }
+
+    public var isExecutableImage: Bool {
+        header.fileType == GhostCodeConstants.MachO.MH_EXECUTE
+    }
+
     public init(data: Data) throws {
         guard data.count >= MemoryLayout<MachHeader64>.size else {
             throw Error.fileTooSmall

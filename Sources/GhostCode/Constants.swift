@@ -45,6 +45,11 @@ public enum GhostCodeConstants {
         /// Load Command: Code signature optimization / dyld info
         public static let LC_DYLD_INFO: UInt32 = 0x22
         public static let LC_DYLD_INFO_ONLY: UInt32 = (0x22 | 0x80000000)
+
+        // MARK: Mach-O File Types (mach_header.filetype)
+
+        /// Main executable image; the only file type that may carry CS_EXECSEG_MAIN_BINARY.
+        public static let MH_EXECUTE: UInt32 = 0x2
     }
 
     // MARK: - Apple Code Signing Structures, Magic & Slots
@@ -88,8 +93,20 @@ public enum GhostCodeConstants {
         // CodeDirectory Feature Flags and Versions
         public static let CS_SUPPORTSSCATTER: UInt32 = 0x20100
         public static let CS_SUPPORTSTEAMID: UInt32 = 0x20200
+        public static let CS_SUPPORTS64BITLIMIT: UInt32 = 0x20300
         public static let CS_SUPPORTSEXECSEG: UInt32 = 0x20400
+
+        /// Fields before the version-gated extensions in a CodeDirectory header.
+        public static let CS_CODEDIRECTORY_BASE_HEADER_SIZE: Int = 44
+
+        // execSegFlags
         public static let CS_EXECSEG_MAIN_BINARY: UInt64 = 0x1
+        public static let CS_EXECSEG_ALLOW_UNSIGNED: UInt64 = 0x10
+
+        // CodeDirectory `flags`
+        public static let CS_ADHOC: UInt32 = 0x2
+        public static let CS_GET_TASK_ALLOW: UInt32 = 0x4
+        public static let CS_ENTITLEMENTS_VALIDATED: UInt32 = 0x20000
     }
 
     // MARK: - Bundle Structure & Paths

@@ -16,6 +16,7 @@ public final class GhostSigner: @unchecked Sendable {
         key: SecKey? = nil,
         rawCertificate: Data? = nil,
         rawPrivateKey: Data? = nil,
+        teamID: String? = nil,
         outputURL: URL? = nil,
         isAdHoc: Bool? = nil
     ) throws {
@@ -34,6 +35,7 @@ public final class GhostSigner: @unchecked Sendable {
             key: key,
             rawCertificate: rawCertificate,
             rawPrivateKey: rawPrivateKey,
+            teamID: teamID,
             isAdHoc: isAdHoc
         )
 
@@ -55,6 +57,7 @@ public final class GhostSigner: @unchecked Sendable {
         rawPrivateKey: Data? = nil,
         infoPlistData: Data? = nil,
         resourceDirData: Data? = nil,
+        teamID: String? = nil,
         isAdHoc: Bool? = nil
     ) throws {
         let hasRawCredentials = (rawCertificate != nil && rawPrivateKey != nil)
@@ -78,17 +81,31 @@ public final class GhostSigner: @unchecked Sendable {
             xmlData = try PropertyListSerialization.data(fromPropertyList: entitlements, format: .xml, options: 0)
         }
 
+        // __TEXT vmsize and file type are unchanged by signature injection, so one read covers both passes.
+        let reader = try MachOReader(data: binaryData)
+        let execSegLimit = reader.textSegmentVMSize ?? 0
+        let isExecutableImage = reader.isExecutableImage
+        let getTaskAllow = entitlements?["get-task-allow"] as? Bool ?? false
+
+        let buildCodeDirectory = { (data: Data) in
+            CodeDirectoryBuilder.build(
+                binaryData: data,
+                codeLimit: codeLimit,
+                identifier: identifier,
+                xmlEntitlements: xmlData,
+                derEntitlements: derData,
+                infoPlistData: infoPlistData,
+                resourceDirData: resourceDirData,
+                teamID: teamID,
+                execSegLimit: execSegLimit,
+                isExecutableImage: isExecutableImage,
+                getTaskAllow: getTaskAllow,
+                isAdHoc: effectiveIsAdHoc
+            )
+        }
+
         // PASS 1: Build initial SuperBlob to establish exact length and offsets
-        let initialCD = CodeDirectoryBuilder.build(
-            binaryData: binaryData,
-            codeLimit: codeLimit,
-            identifier: identifier,
-            xmlEntitlements: xmlData,
-            derEntitlements: derData,
-            infoPlistData: infoPlistData,
-            resourceDirData: resourceDirData,
-            isAdHoc: effectiveIsAdHoc
-        )
+        let initialCD = buildCodeDirectory(binaryData)
 
         var initialCMS: Data? = nil
         if let rawCert = rawCertificate, let rawKey = rawPrivateKey {
@@ -111,16 +128,7 @@ public final class GhostSigner: @unchecked Sendable {
 
         // PASS 2: Re-calculate CodeDirectory page hashes from modified binaryData
         // (Page 0 hash now matches the post-injection headers and load commands)
-        let finalCD = CodeDirectoryBuilder.build(
-            binaryData: binaryData,
-            codeLimit: codeLimit,
-            identifier: identifier,
-            xmlEntitlements: xmlData,
-            derEntitlements: derData,
-            infoPlistData: infoPlistData,
-            resourceDirData: resourceDirData,
-            isAdHoc: effectiveIsAdHoc
-        )
+        let finalCD = buildCodeDirectory(binaryData)
 
         var finalCMS: Data? = nil
         if let rawCert = rawCertificate, let rawKey = rawPrivateKey {
@@ -152,7 +160,8 @@ public final class GhostSigner: @unchecked Sendable {
         key: SecKey? = nil,
         rawCertificate: Data? = nil,
         rawPrivateKey: Data? = nil,
-        entitlements: [String: Any]? = nil
+        entitlements: [String: Any]? = nil,
+        teamID: String? = nil
     ) throws {
         let fileManager = FileManager.default
         let hasRawCredentials = (rawCertificate != nil && rawPrivateKey != nil)
@@ -209,19 +218,30 @@ public final class GhostSigner: @unchecked Sendable {
         }
 
         // 3. Determine bundle entitlements: use provided, extract from embedded.mobileprovision if nil, or default
+        var profileData: Data? = nil
+        if fileManager.fileExists(atPath: embeddedProvURL.path) {
+            profileData = try? Data(contentsOf: embeddedProvURL)
+        }
+        let profile = profileData.flatMap { GhostSigner.provisioningProfileDictionary(from: $0) }
+        let profileEntitlements = profile?["Entitlements"] as? [String: Any]
+
         let bundleEntitlements: [String: Any]
         if let entitlements = entitlements {
             bundleEntitlements = entitlements
-        } else if fileManager.fileExists(atPath: embeddedProvURL.path),
-                  let provData = try? Data(contentsOf: embeddedProvURL),
-                  let extracted = GhostSigner.extractEntitlements(fromMobileProvisionData: provData) {
-            bundleEntitlements = extracted
+        } else if let profileEntitlements, !profileEntitlements.isEmpty {
+            bundleEntitlements = profileEntitlements
         } else {
             bundleEntitlements = [
                 "get-task-allow": true,
                 "application-identifier": bundleID
             ]
         }
+
+        // The team identifier comes from the profile (TeamIdentifier[0]) and is required by every
+        // non-ad-hoc signature; fall back to the entitlement that Apple mirrors it into.
+        let effectiveTeamID = teamID
+            ?? (profile?["TeamIdentifier"] as? [String])?.first
+            ?? bundleEntitlements["com.apple.developer.team-identifier"] as? String
 
         // 4. Sign nested frameworks bottom-up
         let frameworksURL = appURL.appendingPathComponent("Frameworks")
@@ -232,11 +252,11 @@ public final class GhostSigner: @unchecked Sendable {
                     let frameworkExeName = item.deletingPathExtension().lastPathComponent
                     let frameworkExeURL = item.appendingPathComponent(frameworkExeName)
                     if fileManager.fileExists(atPath: frameworkExeURL.path) {
-                        try sign(binaryURL: frameworkExeURL, identifier: frameworkExeName, entitlements: nil, cert: cert, key: key, rawCertificate: rawCertificate, rawPrivateKey: rawPrivateKey, isAdHoc: isAdHoc)
+                        try sign(binaryURL: frameworkExeURL, identifier: frameworkExeName, entitlements: nil, cert: cert, key: key, rawCertificate: rawCertificate, rawPrivateKey: rawPrivateKey, teamID: effectiveTeamID, isAdHoc: isAdHoc)
                     }
                 } else if item.pathExtension == "dylib" {
                     let dylibName = item.deletingPathExtension().lastPathComponent
-                    try sign(binaryURL: item, identifier: dylibName, entitlements: nil, cert: cert, key: key, rawCertificate: rawCertificate, rawPrivateKey: rawPrivateKey, isAdHoc: isAdHoc)
+                    try sign(binaryURL: item, identifier: dylibName, entitlements: nil, cert: cert, key: key, rawCertificate: rawCertificate, rawPrivateKey: rawPrivateKey, teamID: effectiveTeamID, isAdHoc: isAdHoc)
                 }
             }
         }
@@ -246,7 +266,7 @@ public final class GhostSigner: @unchecked Sendable {
         if fileManager.fileExists(atPath: plugInsURL.path) {
             let pluginItems = try? fileManager.contentsOfDirectory(at: plugInsURL, includingPropertiesForKeys: nil)
             for item in pluginItems ?? [] where item.pathExtension == "appex" {
-                try signBundle(appURL: item, cert: cert, key: key, rawCertificate: rawCertificate, rawPrivateKey: rawPrivateKey, entitlements: bundleEntitlements)
+                try signBundle(appURL: item, cert: cert, key: key, rawCertificate: rawCertificate, rawPrivateKey: rawPrivateKey, entitlements: bundleEntitlements, teamID: effectiveTeamID)
             }
         }
 
@@ -265,13 +285,14 @@ public final class GhostSigner: @unchecked Sendable {
             rawPrivateKey: rawPrivateKey,
             infoPlistData: infoPlistData,
             resourceDirData: codeResourcesData,
+            teamID: effectiveTeamID,
             isAdHoc: isAdHoc
         )
         try exeData.write(to: executableURL)
     }
 
-    /// Extracts the Entitlements dictionary from an embedded.mobileprovision or provisioning profile data.
-    public static func extractEntitlements(fromMobileProvisionData data: Data) -> [String: Any]? {
+    /// Parses the XML plist embedded inside a CMS-wrapped provisioning profile.
+    public static func provisioningProfileDictionary(from data: Data) -> [String: Any]? {
         guard let str = String(data: data, encoding: .isoLatin1),
               let startRange = str.range(of: "<plist", options: .caseInsensitive),
               let endRange = str.range(of: "</plist>", options: [.caseInsensitive, .backwards]),
@@ -280,11 +301,27 @@ public final class GhostSigner: @unchecked Sendable {
         }
         let xmlSubstring = str[startRange.lowerBound..<endRange.upperBound]
         guard let xmlData = xmlSubstring.data(using: .utf8),
-              let plist = try? PropertyListSerialization.propertyList(from: xmlData, options: [], format: nil) as? [String: Any],
-              let entitlements = plist["Entitlements"] as? [String: Any] else {
+              let plist = try? PropertyListSerialization.propertyList(from: xmlData, options: [], format: nil) as? [String: Any] else {
             return nil
         }
-        return entitlements
+        return plist
+    }
+
+    /// Extracts the Entitlements dictionary from an embedded.mobileprovision or provisioning profile data.
+    public static func extractEntitlements(fromMobileProvisionData data: Data) -> [String: Any]? {
+        provisioningProfileDictionary(from: data)?["Entitlements"] as? [String: Any]
+    }
+
+    /// The provisioning profile's team ID, which `TeamIdentifier` stores as an array whose first
+    /// entry is authoritative. Required for any non-ad-hoc CodeDirectory's `teamOffset`.
+    public static func extractTeamIdentifier(fromMobileProvisionData data: Data) -> String? {
+        guard let profile = provisioningProfileDictionary(from: data) else {
+            return nil
+        }
+        if let team = (profile["TeamIdentifier"] as? [String])?.first, !team.isEmpty {
+            return team
+        }
+        return (profile["Entitlements"] as? [String: Any])?["com.apple.developer.team-identifier"] as? String
     }
 
     private func getBaseBinarySize(from data: Data) -> Int {
