@@ -5,9 +5,9 @@ import Security
 #endif
 
 public enum CMSSignerError: Swift.Error, Equatable {
-    case creationFailed(Int32)
-    case configurationFailed(Int32)
-    case signingFailed(Int32)
+    case missingCertificate
+    case signingFailed(String)
+    case keyLoadingFailed(String)
     case unsupportedPlatform
 }
 
@@ -23,63 +23,53 @@ public final class SecKey: @unchecked Sendable {
 }
 #endif
 
+/// The private-key half of the code signature. The CMS itself is assembled by `PKCS7Builder`;
+/// this only produces the signature over the authenticated attributes, so the DER work stays
+/// testable without a key.
 public enum CMSSigner {
-    /// Signs code directory data using raw in-memory Certificate and Private Key DER data (No Keychain).
-    public static func signCodeDirectory(codeDirectoryData: Data, rawCertDER: Data, rawKeyDER: Data) throws -> Data {
-        #if canImport(Security) && os(macOS)
-        guard let cert = SecCertificateCreateWithData(nil, rawCertDER as CFData) else {
-            throw CMSSignerError.configurationFailed(-1)
-        }
-        var error: Unmanaged<CFError>?
-        guard let key = SecKeyCreateWithData(rawKeyDER as CFData, [
-            kSecAttrKeyType: kSecAttrKeyTypeRSA,
-            kSecAttrKeyClass: kSecAttrKeyClassPrivate
-        ] as CFDictionary, &error) else {
-            throw CMSSignerError.configurationFailed(-2)
-        }
-        return try signCodeDirectory(codeDirectoryData: codeDirectoryData, cert: cert, key: key)
+    public static func certificateDER(from certificate: SecCertificate) -> Data {
+        #if canImport(Security)
+        SecCertificateCopyData(certificate) as Data
         #else
-        // Mock detached CMS signature for Linux / cross-platform test environments
-        return mockDetachedCMS(for: codeDirectoryData)
+        certificate.data
         #endif
     }
 
-    public static func signCodeDirectory(codeDirectoryData: Data, cert: SecCertificate, key: SecKey) throws -> Data {
-        #if canImport(Security) && os(macOS)
-        var encoder: CMSEncoder?
-        var status = CMSEncoderCreate(&encoder)
-        guard status == errSecSuccess, let encoder else {
-            throw CMSSignerError.creationFailed(status)
+    /// Signs with an in-memory `SecKey`. Both algorithms hash the input themselves, so they are
+    /// handed the raw authenticated attributes.
+    public static func contentSigner(key: SecKey, usesRSA: Bool) -> PKCS7ContentSigner {
+        #if canImport(Security)
+        return { attributes in
+            let algorithm: SecKeyAlgorithm = usesRSA
+                ? .rsaSignatureMessagePKCS1v15SHA256
+                : .ecdsaSignatureMessageX962SHA256
+            var secError: Unmanaged<CFError>?
+            guard let signature = SecKeyCreateSignature(key, algorithm, attributes as CFData, &secError) else {
+                let description = (secError?.takeRetainedValue() as Error?)?.localizedDescription ?? "unknown SecKey failure"
+                throw CMSSignerError.signingFailed(description)
+            }
+            return signature as Data
         }
-
-        status = CMSEncoderSetHasDetachedContent(encoder, true)
-        guard status == errSecSuccess else { throw CMSSignerError.configurationFailed(status) }
-
-        status = codeDirectoryData.withUnsafeBytes { raw in
-            CMSEncoderUpdateContent(encoder, raw.baseAddress!, codeDirectoryData.count)
-        }
-        guard status == errSecSuccess else { throw CMSSignerError.configurationFailed(status) }
-
-        // Set certificate and key
-        status = CMSEncoderAddSigners(encoder, cert)
-        guard status == errSecSuccess else { throw CMSSignerError.configurationFailed(status) }
-
-        var signatureData: CFData?
-        status = CMSEncoderCopyEncodedData(encoder, &signatureData)
-        guard status == errSecSuccess, let cfData = signatureData else {
-            throw CMSSignerError.signingFailed(status)
-        }
-        return cfData as Data
         #else
-        // Mock detached CMS signature for Linux / cross-platform test environments
-        return mockDetachedCMS(for: codeDirectoryData)
+        _ = key
+        _ = usesRSA
+        return { _ in throw CMSSignerError.unsupportedPlatform }
         #endif
     }
 
-    public static func mockDetachedCMS(for data: Data) -> Data {
-        let hash = CryptoHelpers.sha256(data)
-        var mock = Data("CMS_DETACHED_SIGNATURE".utf8)
-        mock.append(hash)
-        return mock
+    #if canImport(Security)
+    /// Wraps a DER private key in a `SecKey` without involving the Keychain.
+    public static func secKey(fromPrivateKeyDER privateKeyDER: Data, usesRSA: Bool) throws -> SecKey {
+        let attributes: [String: Any] = [
+            (kSecAttrKeyType as String): usesRSA ? (kSecAttrKeyTypeRSA as String) : (kSecAttrKeyTypeECSECPrimeRandom as String),
+            (kSecAttrKeyClass as String): (kSecAttrKeyClassPrivate as String)
+        ]
+        var secError: Unmanaged<CFError>?
+        guard let key = SecKeyCreateWithData(privateKeyDER as CFData, attributes as CFDictionary, &secError) else {
+            let description = (secError?.takeRetainedValue() as Error?)?.localizedDescription ?? "unknown SecKey failure"
+            throw CMSSignerError.keyLoadingFailed(description)
+        }
+        return key
     }
+    #endif
 }

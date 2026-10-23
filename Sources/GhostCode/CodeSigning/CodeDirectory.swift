@@ -100,6 +100,34 @@ public struct CodeDirectory: Sendable, Equatable {
     }
 }
 
+/// The hash a CodeDirectory blob is built with. Apple's verifier picks the CD by this, so a
+/// signature carries a SHA-1 CD as slot 0 and a SHA-256 CD as the slot 0x1000 alternate.
+public enum CodeDirectoryHash: Sendable {
+    case sha1
+    case sha256
+
+    public var hashSize: Int {
+        switch self {
+        case .sha1: return CS.CS_HASHSIZE_SHA1
+        case .sha256: return CS.CS_HASHSIZE_SHA256
+        }
+    }
+
+    public var hashType: UInt8 {
+        switch self {
+        case .sha1: return MachOConstants.CS_HASHTYPE_SHA1
+        case .sha256: return MachOConstants.CS_HASHTYPE_SHA256
+        }
+    }
+
+    public func hash(_ data: Data) -> Data {
+        switch self {
+        case .sha1: return CryptoHelpers.sha1(data)
+        case .sha256: return CryptoHelpers.sha256(data)
+        }
+    }
+}
+
 public struct CodeDirectoryBuilder {
     public static let defaultPageSize: Int = 4096
     public static let defaultPageSizeExponent: UInt8 = 12 // 2^12 = 4096
@@ -108,34 +136,38 @@ public struct CodeDirectoryBuilder {
         binaryData: Data,
         codeLimit: Int? = nil,
         identifier: String = "GhostCode",
-        xmlEntitlements: Data? = nil,
-        derEntitlements: Data? = nil,
+        requirementsBlob: Data? = nil,
+        xmlEntitlementsBlob: Data? = nil,
+        derEntitlementsBlob: Data? = nil,
         infoPlistData: Data? = nil,
         resourceDirData: Data? = nil,
         teamID: String? = nil,
         execSegLimit: UInt64 = 0,
         isExecutableImage: Bool = false,
         getTaskAllow: Bool = false,
-        isAdHoc: Bool = true
+        isAdHoc: Bool = true,
+        hash: CodeDirectoryHash = .sha256
     ) -> Data {
         let version: UInt32 = CS.CS_SUPPORTSEXECSEG
         let actualCodeLimit = min(codeLimit ?? binaryData.count, binaryData.count)
         let pageSize = defaultPageSize
         let nCodeSlots = (actualCodeLimit + pageSize - 1) / pageSize
 
-        let hashSize: Int = CS.CS_HASHSIZE_SHA256
+        let hashSize: Int = hash.hashSize
         let emptyHash = Data(repeating: 0, count: hashSize)
 
         // Special slots have negative indexes; slot -k is stored at index (nSpecialSlots - k).
         // Listed here from the most negative to -1 so unused high slots can be trimmed off the front.
+        // Entitlement, requirement and resource-directory slots hash the whole blob header and all;
+        // Info.plist and CodeResources hash the file contents as they sit on disk.
         var specialSlots: [Data] = [
-            derEntitlements.map(sha256) ?? emptyHash,  // -7 CSSLOT_DER_ENTITLEMENTS
-            emptyHash,                                 // -6 reserved
-            xmlEntitlements.map(sha256) ?? emptyHash,  // -5 CSSLOT_ENTITLEMENTS
-            emptyHash,                                 // -4 reserved
-            resourceDirData.map(sha256) ?? emptyHash,  // -3 CSSLOT_RESOURCEDIR
-            emptyHash,                                 // -2 CSSLOT_REQUIREMENTS
-            infoPlistData.map(sha256) ?? emptyHash    // -1 CSSLOT_INFOPLIST
+            derEntitlementsBlob.map(hash.hash) ?? emptyHash,  // -7 CSSLOT_DER_ENTITLEMENTS
+            emptyHash,                                   // -6 reserved
+            xmlEntitlementsBlob.map(hash.hash) ?? emptyHash,  // -5 CSSLOT_ENTITLEMENTS
+            emptyHash,                                   // -4 reserved
+            resourceDirData.map(hash.hash) ?? emptyHash,  // -3 CSSLOT_RESOURCEDIR
+            requirementsBlob.map(hash.hash) ?? emptyHash,  // -2 CSSLOT_REQUIREMENTS
+            infoPlistData.map(hash.hash) ?? emptyHash    // -1 CSSLOT_INFOPLIST
         ]
         if let firstUsed = specialSlots.firstIndex(where: { $0 != emptyHash }) {
             specialSlots.removeSubrange(0..<firstUsed)
@@ -144,7 +176,7 @@ public struct CodeDirectoryBuilder {
         }
 
         var flags: UInt32 = 0
-        if xmlEntitlements != nil || derEntitlements != nil {
+        if xmlEntitlementsBlob != nil || derEntitlementsBlob != nil {
             flags |= CS.CS_ENTITLEMENTS_VALIDATED
         }
         if isAdHoc {
@@ -192,7 +224,7 @@ public struct CodeDirectoryBuilder {
             nCodeSlots: UInt32(nCodeSlots),
             codeLimit: UInt32(actualCodeLimit),
             hashSize: UInt8(hashSize),
-            hashType: MachOConstants.CS_HASHTYPE_SHA256,
+            hashType: hash.hashType,
             platform: 0,
             pageSize: defaultPageSizeExponent,
             spare2: 0,
@@ -241,7 +273,7 @@ public struct CodeDirectoryBuilder {
             let start = slotIndex * pageSize
             let end = min(start + pageSize, actualCodeLimit)
             let pageSlice = binaryData.subdata(in: start..<end)
-            blob.append(sha256(pageSlice))
+            blob.append(hash.hash(pageSlice))
         }
 
         return blob

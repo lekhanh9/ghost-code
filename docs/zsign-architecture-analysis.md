@@ -397,7 +397,10 @@ Propose `CodeSigning/PKCS7Builder.swift`, DER-only, using what ghost-code alread
 - `ContentInfo{ contentType: signedData, [0] EncryptedContent-info{ version, digestAlgorithms{sha256},
   encapContentInfo{ eContent: absent (detached) }, signerInfos:[...] } }`
 - `SignerInfo.version = 3`, `sid = issuerAndSerialNumber`, `digestAlgorithm = sha256`,
-  `signedAttrs`, `authAttr = sha256WithRSAEncryption` (or `ecdsa-with-SHA256`), `signature`.
+  `signedAttrs`, `signatureAlgorithm`, `signature`. Oracle-verified quirk: OpenSSL fills
+  `signatureAlgorithm` from the certificate's SPKI algorithm, so zsign emits `rsaEncryption` +
+  NULL for RSA keys (not `sha256WithRSAEncryption`) and `ecdsa-with-SHA256` with no parameters
+  for EC keys; Apple's verifier accepts both, and ghost-code mirrors zsign byte-for-byte.
 - **Signed attrs** — the two Apple needs, mirroring `openssl.cpp:453-494`:
   - `1.2.840.113635.100.9.1` SET OF one: the `cdhashes` XML plist.
   - `1.2.840.113635.100.9.2` SET OF one: `SEQUENCE { OID(sha256), OCTET STRING(32) }`.

@@ -73,6 +73,9 @@ public enum GhostCodeConstants {
         public static let CSSLOT_APPLICATION: UInt32 = 4
         public static let CSSLOT_ENTITLEMENTS: UInt32 = 5
         public static let CSSLOT_DER_ENTITLEMENTS: UInt32 = 7
+        /// Index range 0x1000...0x1FFF holds alternate CodeDirectories; 0x1000 is the SHA-256 one
+        /// that pairs with the SHA-1 CodeDirectory in slot 0.
+        public static let CSSLOT_ALTERNATE_CODEDIRECTORIES: UInt32 = 0x1000
         public static let CSSLOT_SIGNATURESLOT: UInt32 = 0x10000
 
         // Hash Algorithms
@@ -107,6 +110,22 @@ public enum GhostCodeConstants {
         public static let CS_ADHOC: UInt32 = 0x2
         public static let CS_GET_TASK_ALLOW: UInt32 = 0x4
         public static let CS_ENTITLEMENTS_VALIDATED: UInt32 = 0x20000
+
+        // MARK: Requirement expression opcodes (libsecurity_codesigning/requirement.h)
+
+        public static let REQ_OP_TRUE: UInt32 = 1
+        public static let REQ_OP_IDENT: UInt32 = 2
+        public static let REQ_OP_AND: UInt32 = 6
+        public static let REQ_OP_CERT_FIELD: UInt32 = 11
+        public static let REQ_OP_CERT_GENERIC: UInt32 = 14
+        public static let REQ_OP_APPLE_GENERIC_ANCHOR: UInt32 = 15
+        public static let REQ_MATCH_EXISTS: UInt32 = 0
+        public static let REQ_MATCH_EQUAL: UInt32 = 1
+        public static let SEC_DESIGNATED_REQUIREMENT_TYPE: UInt32 = 3
+
+        /// DER encoding of 1.2.840.113635.100.6.2.1, the WWDR intermediate marker that the
+        /// generated designated requirement tests for.
+        public static let APPLE_WWDR_MARKER_OID_DER: [UInt8] = [0x2a, 0x86, 0x48, 0x86, 0xf7, 0x63, 0x64, 0x06, 0x02, 0x01]
     }
 
     // MARK: - Bundle Structure & Paths
@@ -134,6 +153,25 @@ public enum GhostCodeConstants {
         public static let sha1WithRSAEncryption = "1.2.840.113549.1.1.5"
         /// Apple Code Signing Extended Key Usage: 1.2.840.113635.100.6.1.13
         public static let appleCodeSigningEKU = "1.2.840.113635.100.6.1.13"
+
+        // MARK: PKCS#7 / CMS
+
+        /// CMS signed attribute: content type
+        public static let cmsContentType = "1.2.840.113549.1.9.3"
+        /// CMS signed attribute: message digest
+        public static let cmsMessageDigest = "1.2.840.113549.1.9.4"
+        /// CMS signed attribute: signing time
+        public static let cmsSigningTime = "1.2.840.113549.1.9.5"
+        /// Apple signed attribute: `cdhashes` XML plist, one 20-byte entry per CodeDirectory
+        public static let appleCMSCodeDirectoryHashes = "1.2.840.113635.100.9.1"
+        /// Apple signed attribute: `CDHashes2`, `SEQUENCE { OID sha256, OCTET STRING hash }`
+        public static let appleCMSCodeDirectoryHashes2 = "1.2.840.113635.100.9.2"
+        /// NIST SHA-256: 2.16.840.1.101.3.4.2.1
+        public static let sha256 = "2.16.840.1.101.3.4.2.1"
+        /// ECDSA-with-SHA256: 1.2.840.10045.4.3.2
+        public static let ecdsaWithSHA256 = "1.2.840.10045.4.3.2"
+        /// EC public key: 1.2.840.10045.2.1
+        public static let ecPublicKey = "1.2.840.10045.2.1"
     }
 }
 

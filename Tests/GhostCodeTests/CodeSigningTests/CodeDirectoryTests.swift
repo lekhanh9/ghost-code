@@ -14,17 +14,17 @@ final class CodeDirectoryTests: XCTestCase {
         XCTAssertEqual(abcHex, "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad")
     }
 
-    func testCodeDirectoryWithSpecialSlotMinus7() {
+    func testCodeDirectoryWithSpecialSlotMinus7() throws {
         let dummyBinary = Data(repeating: 0x90, count: 8192) // 2 pages
-        let derData = Data([0x30, 0x05, 0x01, 0x01, 0xFF])
-        let xmlData = Data("<plist></plist>".utf8)
+        let derBlob = CodeSigningSlot.derEntitlements(Data([0x70, 0x03, 0x02, 0x01, 0x01]))
+        let xmlBlob = CodeSigningSlot.xmlEntitlements(Data("<plist></plist>".utf8))
 
         let cdData = CodeDirectoryBuilder.build(
             binaryData: dummyBinary,
             codeLimit: 8192,
             identifier: "com.example.test",
-            xmlEntitlements: xmlData,
-            derEntitlements: derData
+            xmlEntitlementsBlob: xmlBlob,
+            derEntitlementsBlob: derBlob
         )
 
         // Read CodeDirectory header
@@ -43,19 +43,77 @@ final class CodeDirectoryTests: XCTestCase {
         // Offset in cdData: hashOffset - (7 * 32)
         let slot7Offset = Int(hashOffset) - (7 * 32)
         let slot7Hash = cdData.subdata(in: slot7Offset..<(slot7Offset + 32))
-        let expectedDerHash = CodeDirectoryBuilder.sha256(derData)
-        XCTAssertEqual(slot7Hash, expectedDerHash)
+        XCTAssertEqual(slot7Hash, CodeDirectoryBuilder.sha256(derBlob))
 
         // Verify Slot -5 (XML hash)
         let slot5Offset = Int(hashOffset) - (5 * 32)
         let slot5Hash = cdData.subdata(in: slot5Offset..<(slot5Offset + 32))
-        let expectedXmlHash = CodeDirectoryBuilder.sha256(xmlData)
-        XCTAssertEqual(slot5Hash, expectedXmlHash)
+        XCTAssertEqual(slot5Hash, CodeDirectoryBuilder.sha256(xmlBlob))
 
         // Verify Code Slot 0
         let codeSlot0 = cdData.subdata(in: Int(hashOffset)..<(Int(hashOffset) + 32))
         let expectedPage0Hash = CodeDirectoryBuilder.sha256(dummyBinary.subdata(in: 0..<4096))
         XCTAssertEqual(codeSlot0, expectedPage0Hash)
+    }
+
+    func testSpecialSlotsHashTheWholeBlobNotJustThePayload() {
+        // Hashing the payload alone is the bug that makes Apple reject the entitlements slot.
+        let xmlBlob = CodeSigningSlot.xmlEntitlements(Data("<plist></plist>".utf8))
+        let cd = CodeDirectoryBuilder.build(
+            binaryData: Data(repeating: 0, count: 4096),
+            codeLimit: 4096,
+            identifier: "com.example.test",
+            xmlEntitlementsBlob: xmlBlob
+        )
+        let hashOffset = Int(bigEndian32(cd, at: 16))
+        // Unused more-negative slots are trimmed, so slot -5 is the first of the kept window.
+        let slot5 = cd.subdata(in: (hashOffset - 5 * 32)..<(hashOffset - 4 * 32))
+        XCTAssertEqual(slot5, CodeDirectoryBuilder.sha256(xmlBlob))
+        XCTAssertNotEqual(slot5, CodeDirectoryBuilder.sha256(Data("<plist></plist>".utf8)))
+    }
+
+    func testSHA1DirectoryHashesEverySlotWithSHA1() {
+        let binary = Data(repeating: 0x90, count: 8192)
+        let xmlBlob = CodeSigningSlot.xmlEntitlements(Data("<plist></plist>".utf8))
+        let cd = CodeDirectoryBuilder.build(
+            binaryData: binary,
+            codeLimit: 8192,
+            identifier: "com.example.test",
+            xmlEntitlementsBlob: xmlBlob,
+            hash: .sha1
+        )
+
+        XCTAssertEqual(cd[37], 1, "hashType must be CS_HASHTYPE_SHA1")
+        XCTAssertEqual(cd[36], 20, "hashSize must be 20")
+
+        let hashOffset = Int(bigEndian32(cd, at: 16))
+        let nSpecialSlots = Int(bigEndian32(cd, at: 24))
+        XCTAssertEqual(nSpecialSlots, 5)
+        XCTAssertEqual(bigEndian32(cd, at: 28), 2, "nCodeSlots")
+        XCTAssertEqual(UInt32(cd.count), UInt32(hashOffset + 2 * 20), "length accounts for 20-byte slots")
+
+        // Unused more-negative slots are trimmed, so slot -5 is the first of the kept window.
+        let slot5 = cd.subdata(in: (hashOffset - 5 * 20)..<(hashOffset - 4 * 20))
+        XCTAssertEqual(slot5, CryptoHelpers.sha1(xmlBlob))
+        XCTAssertEqual(
+            cd.subdata(in: hashOffset..<(hashOffset + 20)),
+            CryptoHelpers.sha1(binary.subdata(in: 0..<4096))
+        )
+    }
+
+    func testSHA1AndSHA256DirectoriesDifferOnlyInHashesAndHeader() {
+        let binary = Data(repeating: 0x90, count: 8192)
+        let sha1CD = CodeDirectoryBuilder.build(
+            binaryData: binary, codeLimit: 8192,
+            identifier: "com.example.test", teamID: "ABCDE12345", hash: .sha1
+        )
+        let sha256CD = CodeDirectoryBuilder.build(
+            binaryData: binary, codeLimit: 8192,
+            identifier: "com.example.test", teamID: "ABCDE12345", hash: .sha256
+        )
+        XCTAssertEqual(bigEndian32(sha1CD, at: 20), bigEndian32(sha256CD, at: 20), "identOffset")
+        XCTAssertEqual(bigEndian32(sha1CD, at: 48), bigEndian32(sha256CD, at: 48), "teamOffset")
+        XCTAssertLessThan(sha1CD.count, sha256CD.count)
     }
 
     // MARK: - 0x20400 header layout
@@ -78,21 +136,23 @@ final class CodeDirectoryTests: XCTestCase {
         execSegLimit: UInt64 = 0,
         isExecutableImage: Bool = false,
         getTaskAllow: Bool = false,
-        isAdHoc: Bool = true
+        isAdHoc: Bool = true,
+        hash: CodeDirectoryHash = .sha256
     ) -> Data {
         CodeDirectoryBuilder.build(
             binaryData: Data(repeating: 0x90, count: 8192),
             codeLimit: 8192,
             identifier: identifier,
-            xmlEntitlements: xml,
-            derEntitlements: der,
+            xmlEntitlementsBlob: xml.map { CodeSigningSlot.blob(magic: GhostCodeConstants.CodeSigning.CSMAGIC_EMBEDDED_ENTITLEMENTS, payload: $0) },
+            derEntitlementsBlob: der.map { CodeSigningSlot.blob(magic: GhostCodeConstants.CodeSigning.CSMAGIC_EMBEDDED_DER_ENTITLEMENTS, payload: $0) },
             infoPlistData: infoPlist,
             resourceDirData: resourceDir,
             teamID: teamID,
             execSegLimit: execSegLimit,
             isExecutableImage: isExecutableImage,
             getTaskAllow: getTaskAllow,
-            isAdHoc: isAdHoc
+            isAdHoc: isAdHoc,
+            hash: hash
         )
     }
 

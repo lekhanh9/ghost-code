@@ -11,42 +11,46 @@ public struct SuperBlobBuilder {
         }
     }
 
+    /// Assembles the embedded signature SuperBlob. Every argument is a complete slot blob already
+    /// carrying its magic and length; only the CodeDirectory and the alternate CodeDirectory are
+    /// bare blobs because their callers built them that way.
     public static func build(
         codeDirectory: Data,
-        xmlEntitlements: Data? = nil,
-        derEntitlements: Data? = nil,
-        cmsSignature: Data? = nil
+        requirementsBlob: Data? = nil,
+        xmlEntitlementsBlob: Data? = nil,
+        derEntitlementsBlob: Data? = nil,
+        alternateCodeDirectory: Data? = nil,
+        cmsSignatureBlob: Data? = nil
     ) -> Data {
         var entries = [BlobEntry]()
 
         // 1. CodeDirectory (CSSLOT_CODEDIRECTORY = 0)
         entries.append(BlobEntry(type: MachOConstants.CSSLOT_CODEDIRECTORY, data: codeDirectory))
 
-        // 2. XML Entitlements (CSSLOT_ENTITLEMENTS = 5)
-        if let xml = xmlEntitlements {
-            var blob = Data()
-            appendBigEndian(MachOConstants.CSMAGIC_EMBEDDED_ENTITLEMENTS, to: &blob)
-            appendBigEndian(UInt32(8 + xml.count), to: &blob)
-            blob.append(xml)
-            entries.append(BlobEntry(type: MachOConstants.CSSLOT_ENTITLEMENTS, data: blob))
+        // 2. Requirements (CSSLOT_REQUIREMENTS = 2)
+        if let requirements = requirementsBlob {
+            entries.append(BlobEntry(type: MachOConstants.CSSLOT_REQUIREMENTS, data: requirements))
         }
 
-        // 3. DER Entitlements (CSSLOT_DER_ENTITLEMENTS = 7)
-        if let der = derEntitlements {
-            var blob = Data()
-            appendBigEndian(MachOConstants.CSMAGIC_EMBEDDED_DER_ENTITLEMENTS, to: &blob)
-            appendBigEndian(UInt32(8 + der.count), to: &blob)
-            blob.append(der)
-            entries.append(BlobEntry(type: MachOConstants.CSSLOT_DER_ENTITLEMENTS, data: blob))
+        // 3. XML Entitlements (CSSLOT_ENTITLEMENTS = 5)
+        if let xml = xmlEntitlementsBlob {
+            entries.append(BlobEntry(type: MachOConstants.CSSLOT_ENTITLEMENTS, data: xml))
         }
 
-        // 4. CMS Signature (CSSLOT_SIGNATURESLOT = 0x10000) wrapped in CSMAGIC_BLOBWRAPPER
-        if let cms = cmsSignature {
-            var blob = Data()
-            appendBigEndian(MachOConstants.CSMAGIC_BLOBWRAPPER, to: &blob)
-            appendBigEndian(UInt32(8 + cms.count), to: &blob)
-            blob.append(cms)
-            entries.append(BlobEntry(type: MachOConstants.CSSLOT_SIGNATURESLOT, data: blob))
+        // 4. DER Entitlements (CSSLOT_DER_ENTITLEMENTS = 7)
+        if let der = derEntitlementsBlob {
+            entries.append(BlobEntry(type: MachOConstants.CSSLOT_DER_ENTITLEMENTS, data: der))
+        }
+
+        // 5. Alternate CodeDirectory (CSSLOT_ALTERNATE_CODEDIRECTORIES = 0x1000), the SHA-256
+        // partner of the SHA-1 CodeDirectory in slot 0
+        if let alternate = alternateCodeDirectory {
+            entries.append(BlobEntry(type: GhostCodeConstants.CodeSigning.CSSLOT_ALTERNATE_CODEDIRECTORIES, data: alternate))
+        }
+
+        // 6. CMS Signature (CSSLOT_SIGNATURESLOT = 0x10000) wrapped in CSMAGIC_BLOBWRAPPER
+        if let cms = cmsSignatureBlob {
+            entries.append(BlobEntry(type: MachOConstants.CSSLOT_SIGNATURESLOT, data: cms))
         }
 
         return build(entries: entries)

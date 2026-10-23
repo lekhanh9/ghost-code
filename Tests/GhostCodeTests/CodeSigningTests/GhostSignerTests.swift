@@ -565,9 +565,9 @@ final class GhostSignerTests: XCTestCase {
         try signer.signBundle(
             appURL: appDir,
             provisioningProfileURL: provURL,
-            cert: SecCertificate(),
-            key: SecKey(),
-            entitlements: nil
+            rawCertificate: SigningFixtures.leafCertificate,
+            entitlements: nil,
+            contentSigner: { _ in Data(repeating: 0xAB, count: 256) }
         )
 
         let exeURL = appDir.appendingPathComponent("TestApp")

@@ -29,7 +29,8 @@ let package = Package(
         ),
         .testTarget(
             name: "GhostCodeTests",
-            dependencies: ["GhostCode"]
+            dependencies: ["GhostCode"],
+            exclude: ["Fixtures"]
         ),
     ]
 )
