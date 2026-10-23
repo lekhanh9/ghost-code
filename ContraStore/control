@@ -1,0 +1,9 @@
+Package: com.kurishu.contrastore
+Name: ContraStore
+Version: 0.1.0
+Architecture: iphoneos-arm64
+Description: Alternative app installer for jailbroken devices
+Maintainer: kurishu
+Author: kurishu
+Section: Applications
+Depends: firmware (>= 15.0)
